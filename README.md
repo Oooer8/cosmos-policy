@@ -109,6 +109,8 @@ See [ROBOCASA.md](ROBOCASA.md) for fine-tuning/evaluating on RoboCasa simulation
 
 See [ALOHA.md](ALOHA.md) for fine-tuning/evaluating on real-world ALOHA robot tasks.
 
+See [ROBOTWIN.md](ROBOTWIN.md) for converting RoboTwin 2.0 `aloha-agilex` trajectories into ALOHA-format episodes and launching native Cosmos Policy training.
+
 ## Support
 
 If you run into any issues, please open a new GitHub issue. For critical blocking issues, please email Moo Jin Kim (moojink@cs.stanford.edu) to bring the issue to his attention.
