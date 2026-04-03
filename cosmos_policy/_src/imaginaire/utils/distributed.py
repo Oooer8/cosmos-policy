@@ -54,11 +54,19 @@ def init() -> int | None:
     # Set GPU affinity.
     pynvml.nvmlInit()
     local_rank = int(os.getenv("LOCAL_RANK", 0))
-    try:
-        device = Device(local_rank)
-        os.sched_setaffinity(0, device.get_cpu_affinity())
-    except pynvml.NVMLError as e:
-        log.warning(f"Failed to set device affinity: {e}")
+    disable_cpu_affinity = os.getenv("COSMOS_DISABLE_CPU_AFFINITY", "").lower() in {"1", "true", "yes"}
+    if disable_cpu_affinity:
+        log.warning("Skipping device CPU affinity because COSMOS_DISABLE_CPU_AFFINITY is enabled.")
+    else:
+        try:
+            device = Device(local_rank)
+            cpu_affinity = device.get_cpu_affinity()
+            if cpu_affinity:
+                os.sched_setaffinity(0, cpu_affinity)
+            else:
+                log.warning(f"Skipping device CPU affinity for local rank {local_rank}: NVML returned an empty CPU set.")
+        except (AttributeError, OSError, ValueError, pynvml.NVMLError) as e:
+            log.warning(f"Failed to set device CPU affinity for local rank {local_rank}: {e}")
     # Set up NCCL communication.
     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"

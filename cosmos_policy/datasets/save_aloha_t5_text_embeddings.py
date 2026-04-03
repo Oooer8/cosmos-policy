@@ -47,6 +47,10 @@ def main():
     print("Loading data...")
     dataset = ALOHADataset(
         data_dir=data_dir,
+        lazy_load_demos=True,
+        lazy_video_decompression=True,
+        lazy_load_images=True,
+        skip_computing_dataset_statistics=True,
     )
 
     t5_text_embeddings = generate_t5_embeddings(dataset.unique_commands)

@@ -23,6 +23,7 @@ import os
 import pickle
 import random
 import time
+from typing import Any
 
 import cv2
 import h5py
@@ -122,6 +123,46 @@ def load_video_as_images(video_path, resize_size: int = None):
     return frames
 
 
+def load_video_frames_by_indices(video_path: str, frame_indices: list[int], resize_size: int = None) -> dict[int, np.ndarray]:
+    """
+    Load only the requested frame indices from an MP4 video.
+
+    Args:
+        video_path: Absolute path to the MP4 file
+        frame_indices: List of frame indices to load
+        resize_size: Optional square resize size
+
+    Returns:
+        Mapping from frame index to RGB uint8 frame
+    """
+    if len(frame_indices) == 0:
+        return {}
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {video_path}")
+
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames: dict[int, np.ndarray] = {}
+    for frame_idx in sorted(set(frame_indices)):
+        clamped_idx = frame_idx
+        if frame_count > 0:
+            clamped_idx = max(0, min(frame_idx, frame_count - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, clamped_idx)
+        ret, frame_bgr = cap.read()
+        if not ret:
+            raise ValueError(f"Could not read frame {frame_idx} from video file: {video_path}")
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        if resize_size is not None and (
+            frame_rgb.shape[0] != resize_size or frame_rgb.shape[1] != resize_size
+        ):
+            frame_rgb = resize_images(np.expand_dims(frame_rgb, axis=0), resize_size).squeeze(0)
+        frames[frame_idx] = frame_rgb.astype(np.uint8)
+
+    cap.release()
+    return frames
+
+
 def get_video_num_frames(video_path):
     """Return number of frames in an MP4 video using OpenCV metadata."""
     cap = cv2.VideoCapture(video_path)
@@ -162,6 +203,11 @@ def get_history_indices(curr_step_index: int, num_history_indices: int, spacing_
     return tuple(indices.tolist())
 
 
+def _get_aloha_demo_manifest_cache_path(data_dir: str, is_train: bool) -> str:
+    split = "train" if is_train else "val"
+    return os.path.join(data_dir, f"aloha_demo_manifest_{split}.pkl")
+
+
 class ALOHADataset(Dataset):
     def __init__(
         self,
@@ -184,6 +230,9 @@ class ALOHADataset(Dataset):
         return_value_function_returns: bool = False,
         gamma: float = 0.998,
         lazy_video_decompression: bool = False,
+        lazy_load_images: bool = False,
+        lazy_load_demos: bool = False,
+        skip_computing_dataset_statistics: bool = False,
         rollout_data_dir: str = "",
         demonstration_sampling_prob: float = 0.5,
         success_rollout_sampling_prob: float = 0.5,
@@ -218,6 +267,11 @@ class ALOHADataset(Dataset):
             return_value_function_returns (bool): If True, returns value function returns for rollout episodes
             gamma (float): Discount factor for value function returns
             lazy_video_decompression (bool): Whether to lazily decompress videos
+            lazy_load_images (bool): Whether to lazily read raw HDF5 image frames on demand instead of keeping
+                full per-episode image arrays in RAM
+            lazy_load_demos (bool): Whether to load only demo metadata at initialization and fetch arrays/frames
+                on demand inside __getitem__
+            skip_computing_dataset_statistics (bool): If True, skip loading/computing dataset statistics
             rollout_data_dir (str): Path to directory containing rollout data (if provided, will load rollout data in addition to base dataset)
             demonstration_sampling_prob (float): Probability of sampling from demonstration data instead of rollout data
             success_rollout_sampling_prob (float): Probability of sampling from success rollout data instead of failure rollout data
@@ -244,6 +298,8 @@ class ALOHADataset(Dataset):
         self.return_value_function_returns = return_value_function_returns
         self.gamma = gamma
         self.lazy_video_decompression = lazy_video_decompression
+        self.lazy_load_images = lazy_load_images
+        self.lazy_load_demos = lazy_load_demos
         self.rollout_data_dir = rollout_data_dir
         self.demonstration_sampling_prob = demonstration_sampling_prob
         self.success_rollout_sampling_prob = success_rollout_sampling_prob
@@ -252,128 +308,160 @@ class ALOHADataset(Dataset):
         self.use_jpeg_for_rollouts = use_jpeg_for_rollouts
         self.load_all_rollouts_into_ram = load_all_rollouts_into_ram
         self._jpeg_rollout_hint_emitted = False
+        self.demo_episode_metadata = {}
 
-        # Get all HDF5 files in data directory
-        hdf5_files = get_hdf5_files(data_dir, is_train=is_train)
+        manifest_cache_path = _get_aloha_demo_manifest_cache_path(data_dir, is_train)
+        cached_demo_metadata = None
+        if self.lazy_load_demos and os.path.exists(manifest_cache_path):
+            with open(manifest_cache_path, "rb") as file:
+                cached_demo_metadata = pickle.load(file)
+            if os.environ.get("DEBUGGING", "False").lower() == "true":
+                cached_demo_metadata = cached_demo_metadata[:1]
+        else:
+            # Get all HDF5 files in data directory
+            hdf5_files = get_hdf5_files(data_dir, is_train=is_train)
 
-        # In debug mode, only load the first demo
-        if os.environ.get("DEBUGGING", "False").lower() == "true":
-            hdf5_files = hdf5_files[:1]
+            # In debug mode, only load the first demo
+            if os.environ.get("DEBUGGING", "False").lower() == "true":
+                hdf5_files = hdf5_files[:1]
 
-        # Load all episodes into RAM
-        # Save dataset in this structure:
-        # self.data = {
-        #   episode index: {
-        #      images=images,
-        #      left_wrist_images=left_wrist_images,
-        #      right_wrist_images=right_wrist_images,
-        #      proprio=proprio,
-        #      actions=actions,
-        #      command=command,
-        #      num_steps=num_steps,
-        #   }
-        # }
+        # Load demos into RAM or store only metadata, depending on configuration.
         self.data = {}
         self.num_episodes = 0
         self.num_steps = 0
         self.unique_commands = set()
-        for file in tqdm(hdf5_files):
-            with h5py.File(file, "r") as f:
-                # Determine storage format: raw RGB frames vs MP4 video paths
-                obs_group = f["observations"]
-                has_raw_images = "images" in obs_group and all(
-                    cam_key in obs_group["images"] for cam_key in ["cam_high", "cam_left_wrist", "cam_right_wrist"]
-                )
-                has_video_paths = "video_paths" in obs_group and all(
-                    cam_key in obs_group["video_paths"] for cam_key in ["cam_high", "cam_left_wrist", "cam_right_wrist"]
-                )
-
-                # Auto-detect whether to use MP4 videos
-                use_mp4 = has_video_paths and not has_raw_images
-
-                # Load actions and proprio (non-image data)
-                actions = f["action"][:]  # (episode_len, action_dim=14), float32
-                proprio = f["observations/qpos"][:]  # (episode_len, proprio_dim=14), float32
-
-                if not use_mp4:
-                    # Load raw images from HDF5
-                    images = obs_group["images"]["cam_high"][:]  # uint8
-                    left_wrist_images = obs_group["images"]["cam_left_wrist"][:]
-                    right_wrist_images = obs_group["images"]["cam_right_wrist"][:]
-                    episode_num_steps = len(images)
-                else:
-                    # Load MP4 videos
-                    def _read_path(ds):
-                        val = ds[()]
-                        if isinstance(val, bytes):
-                            return val.decode("utf-8")
-                        return str(val)
-
-                    video_filenames = {
-                        "cam_high": _read_path(obs_group["video_paths"]["cam_high"]),
-                        "cam_left_wrist": _read_path(obs_group["video_paths"]["cam_left_wrist"]),
-                        "cam_right_wrist": _read_path(obs_group["video_paths"]["cam_right_wrist"]),
-                    }
-                    file_dir = os.path.dirname(file)
-                    video_paths = {k: os.path.join(file_dir, v) for k, v in video_filenames.items()}
-
-                    if self.lazy_video_decompression:
-                        # Lazy path: store paths and frame count only
-                        images = None
-                        left_wrist_images = None
-                        right_wrist_images = None
-                        episode_num_steps = get_video_num_frames(video_paths["cam_high"])  # assume aligned
-                    else:
-                        # Immediate decompression: load all frames now
-                        images = load_video_as_images(
-                            video_paths["cam_high"], resize_size=self.final_image_size
-                        )  # uint8 RGB
-                        left_wrist_images = load_video_as_images(
-                            video_paths["cam_left_wrist"], resize_size=self.final_image_size
-                        )  # uint8 RGB
-                        right_wrist_images = load_video_as_images(
-                            video_paths["cam_right_wrist"], resize_size=self.final_image_size
-                        )  # uint8 RGB
-                        episode_num_steps = len(images)
-                # Prefer explicit task descriptions in the episode file so that
-                # converted third-party datasets can reuse this loader directly.
-                command = _get_task_description(file, f)
-                self.unique_commands.add(command)
-                num_steps = episode_num_steps
-                # Add value function returns if applicable
+        manifest_entries_to_cache = []
+        if cached_demo_metadata is not None:
+            for episode_metadata in cached_demo_metadata:
+                metadata_entry = dict(episode_metadata)
+                num_steps = int(metadata_entry["num_steps"])
+                metadata_entry["success"] = True
                 if self.return_value_function_returns:
-                    returns = compute_monte_carlo_returns(num_steps, terminal_reward=1.0, gamma=self.gamma)
-                # Add entry to dataset dict
-                episode_entry = dict(
-                    file_path=file,
-                    proprio=proprio,
-                    actions=actions,
-                    command=command,
-                    num_steps=num_steps,
-                    returns=returns.copy() if self.return_value_function_returns else None,
-                    success=True,
-                )
-
-                if use_mp4:
-                    if self.lazy_video_decompression:
-                        episode_entry["video_paths"] = video_paths
-                        episode_entry["is_lazy_video"] = True
-                    else:
-                        episode_entry["images"] = images
-                        episode_entry["left_wrist_images"] = left_wrist_images
-                        episode_entry["right_wrist_images"] = right_wrist_images
-                        episode_entry["is_lazy_video"] = False
-                else:
-                    episode_entry["images"] = images
-                    episode_entry["left_wrist_images"] = left_wrist_images
-                    episode_entry["right_wrist_images"] = right_wrist_images
-                    episode_entry["is_lazy_video"] = False
-
-                self.data[self.num_episodes] = episode_entry
-                # Update number of episodes
+                    metadata_entry["returns"] = compute_monte_carlo_returns(
+                        num_steps, terminal_reward=1.0, gamma=self.gamma
+                    )
+                self.demo_episode_metadata[self.num_episodes] = metadata_entry
+                self.unique_commands.add(metadata_entry["command"])
                 self.num_episodes += 1
-                # Update number of steps
                 self.num_steps += num_steps
+        else:
+            for file in tqdm(hdf5_files):
+                with h5py.File(file, "r") as f:
+                    obs_group = f["observations"]
+                    has_raw_images = "images" in obs_group and all(
+                        cam_key in obs_group["images"] for cam_key in ["cam_high", "cam_left_wrist", "cam_right_wrist"]
+                    )
+                    has_video_paths = "video_paths" in obs_group and all(
+                        cam_key in obs_group["video_paths"] for cam_key in ["cam_high", "cam_left_wrist", "cam_right_wrist"]
+                    )
+                    use_mp4 = has_video_paths and not has_raw_images
+                    num_steps = int(f["action"].shape[0])
+                    command = _get_task_description(file, f)
+                    returns = (
+                        compute_monte_carlo_returns(num_steps, terminal_reward=1.0, gamma=self.gamma)
+                        if self.return_value_function_returns
+                        else None
+                    )
+
+                    metadata_entry: dict[str, Any] = dict(
+                        file_path=file,
+                        command=command,
+                        num_steps=num_steps,
+                        success=True,
+                        storage_format="mp4" if use_mp4 else "raw_hdf5",
+                        returns=returns.copy() if returns is not None else None,
+                    )
+
+                    if use_mp4:
+                        def _read_path(ds):
+                            val = ds[()]
+                            if isinstance(val, bytes):
+                                return val.decode("utf-8")
+                            return str(val)
+
+                        video_filenames = {
+                            "cam_high": _read_path(obs_group["video_paths"]["cam_high"]),
+                            "cam_left_wrist": _read_path(obs_group["video_paths"]["cam_left_wrist"]),
+                            "cam_right_wrist": _read_path(obs_group["video_paths"]["cam_right_wrist"]),
+                        }
+                        file_dir = os.path.dirname(file)
+                        metadata_entry["video_paths"] = {
+                            k: os.path.join(file_dir, v) for k, v in video_filenames.items()
+                        }
+
+                    self.unique_commands.add(command)
+
+                    if self.lazy_load_demos:
+                        self.demo_episode_metadata[self.num_episodes] = metadata_entry
+                        manifest_entries_to_cache.append(metadata_entry)
+                    else:
+                        actions = f["action"][:].astype(np.float32)
+                        proprio = f["observations/qpos"][:].astype(np.float32)
+
+                        is_lazy_hdf5_images = False
+                        if not use_mp4:
+                            if self.lazy_load_images:
+                                images = None
+                                left_wrist_images = None
+                                right_wrist_images = None
+                                is_lazy_hdf5_images = True
+                            else:
+                                images = obs_group["images"]["cam_high"][:]
+                                left_wrist_images = obs_group["images"]["cam_left_wrist"][:]
+                                right_wrist_images = obs_group["images"]["cam_right_wrist"][:]
+                        else:
+                            video_paths = metadata_entry["video_paths"]
+                            if self.lazy_video_decompression:
+                                images = None
+                                left_wrist_images = None
+                                right_wrist_images = None
+                            else:
+                                images = load_video_as_images(
+                                    video_paths["cam_high"], resize_size=self.final_image_size
+                                )
+                                left_wrist_images = load_video_as_images(
+                                    video_paths["cam_left_wrist"], resize_size=self.final_image_size
+                                )
+                                right_wrist_images = load_video_as_images(
+                                    video_paths["cam_right_wrist"], resize_size=self.final_image_size
+                                )
+
+                        episode_entry = dict(
+                            file_path=file,
+                            proprio=proprio,
+                            actions=actions,
+                            command=command,
+                            num_steps=num_steps,
+                            returns=returns.copy() if returns is not None else None,
+                            success=True,
+                        )
+
+                        if use_mp4:
+                            if self.lazy_video_decompression:
+                                episode_entry["video_paths"] = metadata_entry["video_paths"]
+                                episode_entry["is_lazy_video"] = True
+                            else:
+                                episode_entry["images"] = images
+                                episode_entry["left_wrist_images"] = left_wrist_images
+                                episode_entry["right_wrist_images"] = right_wrist_images
+                                episode_entry["is_lazy_video"] = False
+                        else:
+                            episode_entry["images"] = images
+                            episode_entry["left_wrist_images"] = left_wrist_images
+                            episode_entry["right_wrist_images"] = right_wrist_images
+                            episode_entry["is_lazy_video"] = False
+                        if is_lazy_hdf5_images:
+                            episode_entry["is_lazy_hdf5_images"] = True
+                            episode_entry["hdf5_image_file_path"] = file
+
+                        self.data[self.num_episodes] = episode_entry
+
+                    self.num_episodes += 1
+                    self.num_steps += num_steps
+
+            if self.lazy_load_demos and len(manifest_entries_to_cache) > 0:
+                with open(manifest_cache_path, "wb") as file:
+                    pickle.dump(manifest_entries_to_cache, file)
 
         # Build mapping from global step index to episode step (demo data)
         self._build_step_index_mapping()
@@ -385,21 +473,35 @@ class ALOHADataset(Dataset):
             with open(t5_text_embeddings_path, "rb") as file:
                 self.t5_text_embeddings = pickle.load(file)
 
-        # Calculate dataset statistics if the stats file doesn't exist
-        self.dataset_stats = load_or_compute_dataset_statistics(
-            data_dir=self.data_dir,
-            data=self.data,
-            calculate_dataset_statistics_func=calculate_dataset_statistics,
-        )
+        dataset_stats_path = os.path.join(self.data_dir, "dataset_statistics.json")
+        dataset_stats_post_norm_path = os.path.join(self.data_dir, "dataset_statistics_post_norm.json")
+
+        if not skip_computing_dataset_statistics:
+            if self.lazy_load_demos and not os.path.exists(dataset_stats_path):
+                raise ValueError(
+                    "Dataset statistics file does not exist for lazy-loaded ALOHA demos. "
+                    "Please precompute dataset_statistics.json before training with lazy_load_demos=True."
+                )
+            self.dataset_stats = load_or_compute_dataset_statistics(
+                data_dir=self.data_dir,
+                data=self.data,
+                calculate_dataset_statistics_func=calculate_dataset_statistics,
+            )
 
         # Normalize actions and/or proprio
-        if self.normalize_actions or self.normalize_proprio:
-            if self.normalize_actions:
-                self.data = rescale_data(self.data, self.dataset_stats, "actions")
-            if self.normalize_proprio:
-                self.data = rescale_data(self.data, self.dataset_stats, "proprio")
+        if (self.normalize_actions or self.normalize_proprio) and not skip_computing_dataset_statistics:
+            if not self.lazy_load_demos:
+                if self.normalize_actions:
+                    self.data = rescale_data(self.data, self.dataset_stats, "actions")
+                if self.normalize_proprio:
+                    self.data = rescale_data(self.data, self.dataset_stats, "proprio")
 
-            # Calculate post-normalization action statistics
+            if self.lazy_load_demos and not os.path.exists(dataset_stats_post_norm_path):
+                raise ValueError(
+                    "Post-normalization dataset statistics file does not exist for lazy-loaded ALOHA demos. "
+                    "Please precompute dataset_statistics_post_norm.json before training with lazy_load_demos=True."
+                )
+
             self.dataset_stats_post_norm = load_or_compute_post_normalization_statistics(
                 data_dir=self.data_dir,
                 data=self.data,
@@ -417,27 +519,38 @@ class ALOHADataset(Dataset):
 
         # If treating demonstrations as success rollouts, add them to rollout data in-memory
         if self.treat_demos_as_success_rollouts:
-            for _, episode_data in self.data.items():
-                ep_copy = dict(
-                    file_path=episode_data["file_path"],
-                    images=episode_data.get("images"),
-                    left_wrist_images=episode_data.get("left_wrist_images"),
-                    right_wrist_images=episode_data.get("right_wrist_images"),
-                    proprio=episode_data["proprio"],
-                    actions=episode_data["actions"],
-                    command=episode_data["command"],
-                    num_steps=episode_data["num_steps"],
-                    is_lazy_video=episode_data.get("is_lazy_video", False),
-                    success=True,
-                )
-                if self.return_value_function_returns:
-                    # Returns already computed for demos; just copy
-                    ep_copy["returns"] = episode_data.get("returns")
-                if episode_data.get("is_lazy_video", False):
-                    ep_copy["video_paths"] = episode_data["video_paths"]
-                self.rollout_data[self.rollout_num_episodes] = ep_copy
-                self.rollout_num_steps += episode_data["num_steps"]
-                self.rollout_num_episodes += 1
+            if self.lazy_load_demos:
+                for _, episode_metadata in self.demo_episode_metadata.items():
+                    rollout_meta = dict(episode_metadata)
+                    rollout_meta["success"] = True
+                    self.rollout_episode_metadata[self.rollout_num_episodes] = rollout_meta
+                    self.rollout_num_steps += int(episode_metadata["num_steps"])
+                    self.rollout_num_episodes += 1
+            else:
+                for _, episode_data in self.data.items():
+                    ep_copy = dict(
+                        file_path=episode_data["file_path"],
+                        images=episode_data.get("images"),
+                        left_wrist_images=episode_data.get("left_wrist_images"),
+                        right_wrist_images=episode_data.get("right_wrist_images"),
+                        proprio=episode_data["proprio"],
+                        actions=episode_data["actions"],
+                        command=episode_data["command"],
+                        num_steps=episode_data["num_steps"],
+                        is_lazy_video=episode_data.get("is_lazy_video", False),
+                        success=True,
+                    )
+                    if self.return_value_function_returns:
+                        # Returns already computed for demos; just copy
+                        ep_copy["returns"] = episode_data.get("returns")
+                    if episode_data.get("is_lazy_video", False):
+                        ep_copy["video_paths"] = episode_data["video_paths"]
+                    if episode_data.get("is_lazy_hdf5_images", False):
+                        ep_copy["is_lazy_hdf5_images"] = True
+                        ep_copy["hdf5_image_file_path"] = episode_data["hdf5_image_file_path"]
+                    self.rollout_data[self.rollout_num_episodes] = ep_copy
+                    self.rollout_num_steps += episode_data["num_steps"]
+                    self.rollout_num_episodes += 1
 
         if isinstance(self.rollout_data_dir, str) and len(self.rollout_data_dir) > 0:
             assert os.path.exists(self.rollout_data_dir), (
@@ -602,6 +715,9 @@ class ALOHADataset(Dataset):
                     )
                     if episode_data.get("is_lazy_video", False):
                         ep_copy["video_paths"] = episode_data.get("video_paths")
+                    if episode_data.get("is_lazy_hdf5_images", False):
+                        ep_copy["is_lazy_hdf5_images"] = True
+                        ep_copy["hdf5_image_file_path"] = episode_data.get("hdf5_image_file_path")
                     if episode_data.get("is_lazy_jpeg", False):
                         ep_copy["is_lazy_jpeg"] = True
                         ep_copy["jpeg_file_path"] = episode_data.get("jpeg_file_path")
@@ -628,7 +744,8 @@ class ALOHADataset(Dataset):
 
     def _build_step_index_mapping(self):
         """Build a mapping from global step index to (episode index, relative index within episode)."""
-        result = build_demo_step_index_mapping(self.data)
+        demo_source = self.demo_episode_metadata if self.lazy_load_demos else self.data
+        result = build_demo_step_index_mapping(demo_source)
         self._step_to_episode_map = result["_step_to_episode_map"]
         self._total_steps = result["_total_steps"]
 
@@ -677,6 +794,86 @@ class ALOHADataset(Dataset):
             return self.epoch_length
         return self.num_steps
 
+    def _ensure_frame_size(self, img: np.ndarray) -> np.ndarray:
+        """Resize a single frame to the configured square resolution if needed."""
+        if img.shape[0] != self.final_image_size or img.shape[1] != self.final_image_size:
+            return resize_images(np.expand_dims(img, axis=0), self.final_image_size).squeeze(0)
+        return img
+
+    def _load_raw_hdf5_frames(
+        self, file_path: str, current_idx: int, future_idx: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Load only the current/future triplet of raw HDF5 frames needed for one sample."""
+        with h5py.File(file_path, "r") as f:
+            image_group = f["observations"]["images"]
+
+            def _read_frame(camera_key: str, frame_idx: int) -> np.ndarray:
+                return self._ensure_frame_size(image_group[camera_key][frame_idx])
+
+            primary_current = _read_frame("cam_high", current_idx)
+            left_current = _read_frame("cam_left_wrist", current_idx)
+            right_current = _read_frame("cam_right_wrist", current_idx)
+            primary_future = _read_frame("cam_high", future_idx)
+            left_future = _read_frame("cam_left_wrist", future_idx)
+            right_future = _read_frame("cam_right_wrist", future_idx)
+
+        return primary_current, left_current, right_current, primary_future, left_future, right_future
+
+    def _load_demo_episode_data(self, episode_metadata):
+        """Load one demo episode on demand from metadata."""
+        file = episode_metadata["file_path"]
+        with h5py.File(file, "r") as f:
+            obs_group = f["observations"]
+            actions = f["action"][:].astype(np.float32)
+            proprio = f["observations/qpos"][:].astype(np.float32)
+
+            if self.normalize_actions:
+                actions = rescale_episode_data({"actions": actions}, self.dataset_stats, "actions")
+            if self.normalize_proprio:
+                proprio = rescale_episode_data({"proprio": proprio}, self.dataset_stats, "proprio")
+
+            episode_entry = dict(
+                file_path=file,
+                proprio=proprio,
+                actions=actions,
+                command=episode_metadata["command"],
+                num_steps=int(episode_metadata["num_steps"]),
+                returns=episode_metadata.get("returns"),
+                success=True,
+            )
+
+            if episode_metadata["storage_format"] == "mp4":
+                if self.lazy_video_decompression:
+                    episode_entry["is_lazy_video"] = True
+                    episode_entry["video_paths"] = episode_metadata["video_paths"]
+                else:
+                    video_paths = episode_metadata["video_paths"]
+                    episode_entry["images"] = load_video_as_images(
+                        video_paths["cam_high"], resize_size=self.final_image_size
+                    )
+                    episode_entry["left_wrist_images"] = load_video_as_images(
+                        video_paths["cam_left_wrist"], resize_size=self.final_image_size
+                    )
+                    episode_entry["right_wrist_images"] = load_video_as_images(
+                        video_paths["cam_right_wrist"], resize_size=self.final_image_size
+                    )
+                    episode_entry["is_lazy_video"] = False
+            else:
+                if self.lazy_load_images:
+                    episode_entry["images"] = None
+                    episode_entry["left_wrist_images"] = None
+                    episode_entry["right_wrist_images"] = None
+                    episode_entry["is_lazy_video"] = False
+                    episode_entry["is_lazy_hdf5_images"] = True
+                    episode_entry["hdf5_image_file_path"] = file
+                else:
+                    episode_entry["images"] = obs_group["images"]["cam_high"][:]
+                    episode_entry["left_wrist_images"] = obs_group["images"]["cam_left_wrist"][:]
+                    episode_entry["right_wrist_images"] = obs_group["images"]["cam_right_wrist"][:]
+                    episode_entry["is_lazy_video"] = False
+
+        return episode_entry
+
     def __getitem__(self, idx):
         """
         Fetches images and action chunk sample by index.
@@ -716,8 +913,12 @@ class ALOHADataset(Dataset):
             global_step_idx = idx % self.num_steps
             # Using global step index, get episode index and relative step index within that episode
             episode_idx, relative_step_idx = self._step_to_episode_map[global_step_idx]
-            episode_metadata = None
-            episode_data = self.data[episode_idx]
+            if self.lazy_load_demos:
+                episode_metadata = self.demo_episode_metadata[episode_idx]
+                episode_data = self._load_demo_episode_data(episode_metadata)
+            else:
+                episode_metadata = None
+                episode_data = self.data[episode_idx]
             global_rollout_idx = -1
         elif sample_type == "success_rollout":
             success_idx = idx - self.adjusted_demo_count
@@ -762,32 +963,18 @@ class ALOHADataset(Dataset):
                 is_world_model_sample = True
                 is_value_function_sample = False
 
-        # Lazy-load videos for this episode if needed (demos or rollouts)
-        if episode_data.get("is_lazy_video", False) and (
-            ("images" not in episode_data) or (episode_data["images"] is None)
-        ):
-            video_paths = episode_data["video_paths"]
-            images = load_video_as_images(video_paths["cam_high"], resize_size=self.final_image_size)  # uint8
-            left_wrist_images = load_video_as_images(
-                video_paths["cam_left_wrist"], resize_size=self.final_image_size
-            )  # uint8
-            right_wrist_images = load_video_as_images(
-                video_paths["cam_right_wrist"], resize_size=self.final_image_size
-            )  # uint8
-            episode_data["images"] = images
-            episode_data["left_wrist_images"] = left_wrist_images
-            episode_data["right_wrist_images"] = right_wrist_images
-            episode_data["is_lazy_video"] = False
-
-        t_prev = time.time()
-
         # Calculate future frame index if needed (used by lazy JPEG and later logic)
         future_frame_idx = relative_step_idx + self.chunk_size
         max_possible_idx = episode_data["num_steps"] - 1
         if future_frame_idx > max_possible_idx:
             future_frame_idx = max_possible_idx
 
-        # If JPEG-in-HDF5 lazy mode, fetch only required frames for current and future steps
+        # If JPEG-in-HDF5, raw-HDF5, or MP4 lazy mode, fetch only required frames for current and future steps.
+        use_lazy_frame_fetch = (
+            episode_data.get("is_lazy_jpeg", False)
+            or episode_data.get("is_lazy_hdf5_images", False)
+            or episode_data.get("is_lazy_video", False)
+        )
         primary_current = None
         left_current = None
         right_current = None
@@ -821,18 +1008,41 @@ class ALOHADataset(Dataset):
                 if right_key and right_key in f_j:
                     right_future = _decode_one(f_j[right_key], future_frame_idx)
 
-            # Ensure frames are the expected size
-            def _ensure_size(img: np.ndarray) -> np.ndarray:
-                if img.shape[0] != self.final_image_size or img.shape[1] != self.final_image_size:
-                    return resize_images(np.expand_dims(img, axis=0), self.final_image_size).squeeze(0)
-                return img
-
-            primary_current = _ensure_size(primary_current)
-            left_current = _ensure_size(left_current)
-            right_current = _ensure_size(right_current)
-            primary_future = _ensure_size(primary_future)
-            left_future = _ensure_size(left_future)
-            right_future = _ensure_size(right_future)
+            primary_current = self._ensure_frame_size(primary_current)
+            left_current = self._ensure_frame_size(left_current)
+            right_current = self._ensure_frame_size(right_current)
+            primary_future = self._ensure_frame_size(primary_future)
+            left_future = self._ensure_frame_size(left_future)
+            right_future = self._ensure_frame_size(right_future)
+        elif episode_data.get("is_lazy_hdf5_images", False):
+            (
+                primary_current,
+                left_current,
+                right_current,
+                primary_future,
+                left_future,
+                right_future,
+            ) = self._load_raw_hdf5_frames(
+                episode_data["hdf5_image_file_path"], relative_step_idx, future_frame_idx
+            )
+        elif episode_data.get("is_lazy_video", False):
+            frame_indices = [relative_step_idx, future_frame_idx]
+            video_paths = episode_data["video_paths"]
+            primary_frames = load_video_frames_by_indices(
+                video_paths["cam_high"], frame_indices, resize_size=self.final_image_size
+            )
+            left_frames = load_video_frames_by_indices(
+                video_paths["cam_left_wrist"], frame_indices, resize_size=self.final_image_size
+            )
+            right_frames = load_video_frames_by_indices(
+                video_paths["cam_right_wrist"], frame_indices, resize_size=self.final_image_size
+            )
+            primary_current = primary_frames[relative_step_idx]
+            left_current = left_frames[relative_step_idx]
+            right_current = right_frames[relative_step_idx]
+            primary_future = primary_frames[future_frame_idx]
+            left_future = left_frames[future_frame_idx]
+            right_future = right_frames[future_frame_idx]
 
         # Build a list of unique frames (no per-frame duplication) and per-frame repeat counts
         # We'll preprocess the unique frames once (same aug params across the whole sequence),
@@ -857,7 +1067,7 @@ class ALOHADataset(Dataset):
 
         # Add blank first input image (needed for the tokenizer)
         ref_image_for_shape = (
-            primary_current if episode_data.get("is_lazy_jpeg", False) else episode_data["images"][relative_step_idx]
+            primary_current if use_lazy_frame_fetch else episode_data["images"][relative_step_idx]
         )
         blank_first_input_frame = np.zeros_like(ref_image_for_shape)
         frames.append(blank_first_input_frame)
@@ -868,17 +1078,10 @@ class ALOHADataset(Dataset):
         # Add current proprio
         if self.use_proprio:
             proprio = episode_data["proprio"][relative_step_idx]
-            image = (
-                primary_current
-                if episode_data.get("is_lazy_jpeg", False)
-                else episode_data["images"][relative_step_idx]
-            )
             # Proprio values will be injected into latent diffusion sequence later
             # For now just add blank image
             blank_proprio_image = np.zeros_like(
-                primary_current
-                if episode_data.get("is_lazy_jpeg", False)
-                else episode_data["images"][relative_step_idx]
+                primary_current if use_lazy_frame_fetch else episode_data["images"][relative_step_idx]
             )
             current_proprio_latent_idx = segment_idx
             frames.append(blank_proprio_image)
@@ -888,9 +1091,7 @@ class ALOHADataset(Dataset):
 
         # Add current left wrist image
         left_wrist_image = (
-            left_current
-            if episode_data.get("is_lazy_jpeg", False)
-            else episode_data["left_wrist_images"][relative_step_idx]
+            left_current if use_lazy_frame_fetch else episode_data["left_wrist_images"][relative_step_idx]
         )
         current_wrist_image_latent_idx = segment_idx
         frames.append(left_wrist_image)
@@ -900,9 +1101,7 @@ class ALOHADataset(Dataset):
 
         # Add current right wrist image
         right_wrist_image = (
-            right_current
-            if episode_data.get("is_lazy_jpeg", False)
-            else episode_data["right_wrist_images"][relative_step_idx]
+            right_current if use_lazy_frame_fetch else episode_data["right_wrist_images"][relative_step_idx]
         )
         current_wrist_image2_latent_idx = segment_idx
         frames.append(right_wrist_image)
@@ -912,7 +1111,7 @@ class ALOHADataset(Dataset):
 
         # Add current primary image
         primary_image = (
-            primary_current if episode_data.get("is_lazy_jpeg", False) else episode_data["images"][relative_step_idx]
+            primary_current if use_lazy_frame_fetch else episode_data["images"][relative_step_idx]
         )
         current_image_latent_idx = segment_idx
         frames.append(primary_image)
@@ -922,7 +1121,7 @@ class ALOHADataset(Dataset):
 
         # Add blank image for action chunk
         blank_action_image = np.zeros_like(
-            primary_current if episode_data.get("is_lazy_jpeg", False) else episode_data["images"][relative_step_idx]
+            primary_current if use_lazy_frame_fetch else episode_data["images"][relative_step_idx]
         )
         action_latent_idx = segment_idx
         frames.append(blank_action_image)
@@ -936,9 +1135,7 @@ class ALOHADataset(Dataset):
             # Proprio values will be injected into latent diffusion sequence later
             # For now just add blank image
             blank_proprio_image = np.zeros_like(
-                primary_current
-                if episode_data.get("is_lazy_jpeg", False)
-                else episode_data["images"][relative_step_idx]
+                primary_current if use_lazy_frame_fetch else episode_data["images"][relative_step_idx]
             )
             future_proprio_latent_idx = segment_idx
             frames.append(blank_proprio_image)
@@ -950,9 +1147,7 @@ class ALOHADataset(Dataset):
 
         # Add future left wrist image
         future_left_wrist_image = (
-            left_future
-            if episode_data.get("is_lazy_jpeg", False)
-            else episode_data["left_wrist_images"][future_frame_idx]
+            left_future if use_lazy_frame_fetch else episode_data["left_wrist_images"][future_frame_idx]
         )
         future_wrist_image_latent_idx = segment_idx
         frames.append(future_left_wrist_image)
@@ -962,9 +1157,7 @@ class ALOHADataset(Dataset):
 
         # Add future right wrist image
         future_right_wrist_image = (
-            right_future
-            if episode_data.get("is_lazy_jpeg", False)
-            else episode_data["right_wrist_images"][future_frame_idx]
+            right_future if use_lazy_frame_fetch else episode_data["right_wrist_images"][future_frame_idx]
         )
         future_wrist_image2_latent_idx = segment_idx
         frames.append(future_right_wrist_image)
@@ -974,7 +1167,7 @@ class ALOHADataset(Dataset):
 
         # Add future primary image
         future_image = (
-            primary_future if episode_data.get("is_lazy_jpeg", False) else episode_data["images"][future_frame_idx]
+            primary_future if use_lazy_frame_fetch else episode_data["images"][future_frame_idx]
         )
         future_image_latent_idx = segment_idx
         frames.append(future_image)
@@ -985,9 +1178,7 @@ class ALOHADataset(Dataset):
         # Add blank value image
         if self.return_value_function_returns:
             value_image = np.zeros_like(
-                primary_current
-                if episode_data.get("is_lazy_jpeg", False)
-                else episode_data["images"][relative_step_idx]
+                primary_current if use_lazy_frame_fetch else episode_data["images"][relative_step_idx]
             )
             value_latent_idx = segment_idx
             frames.append(value_image)
@@ -1185,11 +1376,20 @@ class ALOHADataset(Dataset):
                     right_key = "wrist_right_images_jpeg"
 
             elif not use_mp4:
-                images = obs_group["images"]["cam_high"][:]
-                left_wrist_images = obs_group["images"]["cam_left_wrist"][:]
-                right_wrist_images = obs_group["images"]["cam_right_wrist"][:]
-                is_lazy_video = False
-                video_paths = None
+                if self.lazy_load_images:
+                    images = None
+                    left_wrist_images = None
+                    right_wrist_images = None
+                    is_lazy_video = False
+                    video_paths = None
+                    is_lazy_hdf5_images = True
+                else:
+                    images = obs_group["images"]["cam_high"][:]
+                    left_wrist_images = obs_group["images"]["cam_left_wrist"][:]
+                    right_wrist_images = obs_group["images"]["cam_right_wrist"][:]
+                    is_lazy_video = False
+                    video_paths = None
+                    is_lazy_hdf5_images = False
             else:
 
                 def _read_path(ds):
@@ -1222,6 +1422,7 @@ class ALOHADataset(Dataset):
                         video_paths["cam_right_wrist"], resize_size=self.final_image_size
                     )  # uint8 RGB
                     is_lazy_video = False
+                is_lazy_hdf5_images = False
 
             # Apply normalization if needed
             if self.normalize_actions:
@@ -1242,6 +1443,9 @@ class ALOHADataset(Dataset):
             )
             if is_lazy_video:
                 episode_entry["video_paths"] = video_paths
+            if (not use_mp4) and (not use_jpeg) and self.lazy_load_images:
+                episode_entry["is_lazy_hdf5_images"] = True
+                episode_entry["hdf5_image_file_path"] = file
             if use_jpeg:
                 episode_entry["is_lazy_jpeg"] = True
                 episode_entry["jpeg_file_path"] = file
