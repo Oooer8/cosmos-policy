@@ -22,7 +22,6 @@ from typing import Any, Tuple
 import torch
 import torch.distributed as dist
 import torch.utils.data
-import wandb
 
 from cosmos_policy._src.imaginaire.model import ImaginaireModel
 from cosmos_policy._src.imaginaire.utils import distributed, log, misc, wandb_util
@@ -90,8 +89,7 @@ class WandbCallback(Callback):
         # read optional job_env saved by `log_reproducible_setup`
         if os.path.exists(f"{job_local_path}/job_env.yaml"):
             job_info = easy_io.load(f"{job_local_path}/job_env.yaml")
-            if wandb.run:
-                wandb.run.config.update({f"JOB_INFO/{k}": v for k, v in job_info.items()}, allow_val_change=True)
+            wandb_util.update_config({f"JOB_INFO/{k}": v for k, v in job_info.items()}, allow_val_change=True)
 
         if os.path.exists(f"{config.job.path_local}/config.yaml") and "SLURM_LOG_DIR" in os.environ:
             easy_io.copyfile(
@@ -108,14 +106,15 @@ class WandbCallback(Callback):
         iteration: int = 0,
     ) -> None:  # Log the curent learning rate.
         if iteration % self.config.trainer.logging_iter == 0 and distributed.is_rank0():
+            logged_iteration = iteration + 1
             info = {}
-            info["sample_counter"] = getattr(self.trainer, "sample_counter", iteration)
+            info["sample_counter"] = getattr(self.trainer, "sample_counter", logged_iteration)
 
             for i, param_group in enumerate(optimizer.param_groups):
                 info[f"optim/lr_{i}"] = param_group["lr"]
                 info[f"optim/weight_decay_{i}"] = param_group["weight_decay"]
 
-            wandb.log(info, step=iteration)
+            wandb_util.log(info, step=logged_iteration)
 
     def on_training_step_end(
         self,
@@ -195,8 +194,7 @@ class WandbCallback(Callback):
                             f"s3://rundir/{self.name}/Train_Iter{iteration:09d}.json",
                         )
 
-                if wandb:
-                    wandb.log(info, step=iteration)
+                wandb_util.log(info, step=iteration)
             if self.logging_iter_multipler == 1:
                 self.trainer.training_timer.reset()
 
@@ -236,7 +234,7 @@ class WandbCallback(Callback):
         # Log data/stats of validation set to W&B.
         if distributed.is_rank0():
             log.info(f"Validation loss (iteration {iteration}): {loss}")
-            wandb.log({"val/loss": loss}, step=iteration)
+            wandb_util.log({"val/loss": loss}, step=iteration)
 
     def on_train_end(self, model: ImaginaireModel, iteration: int = 0) -> None:
-        wandb.finish()
+        wandb_util.finish()

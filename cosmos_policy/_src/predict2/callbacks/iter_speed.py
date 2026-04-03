@@ -16,13 +16,12 @@
 import time
 
 import torch
-import wandb
 from torch import Tensor
 
 from cosmos_policy._src.imaginaire.callbacks.every_n import EveryN
 from cosmos_policy._src.imaginaire.model import ImaginaireModel
 from cosmos_policy._src.imaginaire.trainer import ImaginaireTrainer
-from cosmos_policy._src.imaginaire.utils import log
+from cosmos_policy._src.imaginaire.utils import log, wandb_util
 from cosmos_policy._src.imaginaire.utils.distributed import rank0_only
 from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
 
@@ -85,15 +84,14 @@ class IterSpeed(EveryN):
 
         log.info(f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {loss.item():.4f}")
 
-        if wandb.run:
-            sample_counter = getattr(trainer, "sample_counter", iteration)
-            wandb.log(
-                {
-                    "timer/iter_speed": iter_speed,
-                    "sample_counter": sample_counter,
-                },
-                step=iteration,
-            )
+        sample_counter = getattr(trainer, "sample_counter", iteration)
+        wandb_util.log(
+            {
+                "timer/iter_speed": iter_speed,
+                "sample_counter": sample_counter,
+            },
+            step=iteration,
+        )
         self.time = cur_time
         if self.save_s3:
             if iteration % (self.save_s3_every_log_n * self.every_n) == 0:

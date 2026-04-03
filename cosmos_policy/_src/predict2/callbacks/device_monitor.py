@@ -25,7 +25,7 @@ import wandb
 from cosmos_policy._src.imaginaire.callbacks.every_n import EveryN
 from cosmos_policy._src.imaginaire.model import ImaginaireModel
 from cosmos_policy._src.imaginaire.trainer import ImaginaireTrainer
-from cosmos_policy._src.imaginaire.utils import distributed, log
+from cosmos_policy._src.imaginaire.utils import distributed, log, wandb_util
 from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
 
 
@@ -61,10 +61,10 @@ def log_prof_data(
     df = pd.DataFrame(data, columns=columns)
     summary_df = pd.DataFrame({"Avg": avg_values, "Max": max_values, "Min": min_values})
 
-    if wandb.run:
+    if wandb_util.is_active():
         # Log the table
         table = wandb.Table(dataframe=df)
-        wandb.log({"DeviceMonitor/prof_data": table}, step=iteration)
+        wandb_util.log({"DeviceMonitor/prof_data": table}, step=iteration)
 
         # Log summary statistics
         summary = {}
@@ -73,7 +73,7 @@ def log_prof_data(
             summary[f"DeviceMonitor/max_{key}"] = max_values[key]
             summary[f"DeviceMonitor/avg_{key}"] = avg_values[key]
 
-        wandb.log(summary, step=iteration)
+        wandb_util.log(summary, step=iteration)
     return df, summary_df
 
 
@@ -181,9 +181,9 @@ class DeviceMonitor(EveryN):
             log.info(f"{self.name} Stats:\n{summary_df.to_string()}")
             if self.log_memory_detail:
                 memory_stats = torch.cuda.memory_stats()
-                if wandb.run:
+                if wandb_util.is_active():
                     wandb_memory_info = {f"mem/{key}": memory_stats[key] for key in memory_stats.keys()}
-                    wandb.log(wandb_memory_info, step=iteration)
+                    wandb_util.log(wandb_memory_info, step=iteration)
                 if self.save_s3:
                     global_step = iteration // self.step_size
                     should_run = global_step % self.upload_every_n == 0

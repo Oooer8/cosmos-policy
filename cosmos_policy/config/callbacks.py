@@ -18,12 +18,11 @@ from typing import Tuple
 import torch
 import torch.distributed as dist
 import torch.utils.data
-import wandb
 from hydra.core.config_store import ConfigStore
 
 from cosmos_policy._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_policy._src.imaginaire.model import ImaginaireModel
-from cosmos_policy._src.imaginaire.utils import distributed, log
+from cosmos_policy._src.imaginaire.utils import distributed, log, wandb_util
 from cosmos_policy._src.imaginaire.utils.callback import WandBCallback as WandBCallbackImage
 from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
 from cosmos_policy._src.predict2.callbacks.wandb_log import _LossRecord
@@ -357,8 +356,7 @@ class WandbCallback(WandBCallbackImage):
                             f"s3://rundir/{self.name}/Train_Iter{iteration:09d}.json",
                         )
 
-                if wandb:
-                    wandb.log(info, step=iteration)
+                wandb_util.log(info, step=iteration)
             if self.logging_iter_multipler == 1:
                 self.trainer.training_timer.reset()
 
@@ -609,8 +607,7 @@ class WandbCallback(WandBCallbackImage):
                             f"s3://rundir/{self.name}/Val_Iter{iteration:09d}.json",
                         )
 
-                if wandb:
-                    wandb.log(info, step=iteration)
+                wandb_util.log(info, step=iteration)
 
                 log.info(f"Validation final loss (iteration {iteration}): {avg_final_loss:4f}")
 

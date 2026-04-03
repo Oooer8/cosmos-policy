@@ -17,10 +17,9 @@ import time
 
 import numpy as np
 import torch
-import wandb
 
 from cosmos_policy._src.imaginaire.model import ImaginaireModel
-from cosmos_policy._src.imaginaire.utils import distributed
+from cosmos_policy._src.imaginaire.utils import distributed, wandb_util
 from cosmos_policy._src.imaginaire.utils.callback import Callback
 from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
 
@@ -85,8 +84,7 @@ class DetailedDataLoadingSpeedMonitor(Callback):
                 }
             )
 
-            if wandb.run:
-                wandb.log(wandb_info, step=iteration)
+            wandb_util.log(wandb_info, step=iteration)
 
             if self.save_s3 and distributed.is_rank0():
                 easy_io.dump(

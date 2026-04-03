@@ -16,10 +16,9 @@
 from typing import List, Optional
 
 import torch
-import wandb
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-from cosmos_policy._src.imaginaire.utils import distributed
+from cosmos_policy._src.imaginaire.utils import distributed, wandb_util
 from cosmos_policy._src.imaginaire.utils.callback import Callback
 
 
@@ -74,5 +73,4 @@ class GradClip(Callback):
 
         # log
         if iteration % self.config.trainer.logging_iter == 0:
-            if wandb.run:
-                wandb.log({"clip_grad_norm": total_norm.item()}, step=iteration)
+            wandb_util.log({"clip_grad_norm": total_norm.item()}, step=iteration + 1)

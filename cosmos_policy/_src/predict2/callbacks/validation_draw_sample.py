@@ -28,7 +28,7 @@ from einops import rearrange, repeat
 from megatron.core import parallel_state
 
 from cosmos_policy._src.imaginaire.model import ImaginaireModel
-from cosmos_policy._src.imaginaire.utils import distributed, log, misc
+from cosmos_policy._src.imaginaire.utils import distributed, log, misc, wandb_util
 from cosmos_policy._src.imaginaire.utils.callback import Callback
 from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
 from cosmos_policy._src.imaginaire.utils.parallel_state_helper import is_tp_cp_pp_rank0
@@ -269,7 +269,7 @@ class ValidationDrawSample(Callback):
 
         log.debug("waiting for all ranks to finish", rank0_only=False)
         dist.barrier()
-        if self.rank == 0 and wandb.run:
+        if self.rank == 0 and wandb_util.is_active():
             sample_counter = getattr(trainer, "sample_counter", iteration)
             data_type = "image" if model.is_image_batch(data_batch) else "video"
             tag += f"_{data_type}"
@@ -294,7 +294,7 @@ class ValidationDrawSample(Callback):
                 imgs.append(wandb.Image(os.path.join(sample_save_dir, fp), caption=f"{sample_counter}"))
 
             info[f"{self.name}/{tag}_sample"] = imgs
-            wandb.log(
+            wandb_util.log(
                 info,
                 step=iteration,
             )

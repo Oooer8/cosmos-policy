@@ -17,9 +17,8 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
-import wandb
 
-from cosmos_policy._src.imaginaire.utils import distributed
+from cosmos_policy._src.imaginaire.utils import distributed, wandb_util
 from cosmos_policy._src.imaginaire.utils.callback import Callback
 from cosmos_policy._src.predict2.models.text2world_model import DiffusionModel
 
@@ -101,12 +100,11 @@ class GradClip(Callback):
         self._cur_state.update(total_norm)
         if iteration % self.config.trainer.logging_iter == 0:
             avg_img_mag, avg_video_mag = self.img_mag_log.get_stat(), self.video_mag_log.get_stat()
-            if wandb.run:
-                wandb.log(
-                    {
-                        "clip_grad_norm/image": avg_img_mag,
-                        "clip_grad_norm/video": avg_video_mag,
-                        "iteration": iteration,
-                    },
-                    step=iteration,
-                )
+            wandb_util.log(
+                {
+                    "clip_grad_norm/image": avg_img_mag,
+                    "clip_grad_norm/video": avg_video_mag,
+                    "iteration": iteration + 1,
+                },
+                step=iteration + 1,
+            )

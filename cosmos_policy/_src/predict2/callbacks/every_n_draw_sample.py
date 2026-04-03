@@ -31,7 +31,7 @@ from megatron.core import parallel_state
 
 from cosmos_policy._src.imaginaire.callbacks.every_n import EveryN
 from cosmos_policy._src.imaginaire.model import ImaginaireModel
-from cosmos_policy._src.imaginaire.utils import distributed, log, misc
+from cosmos_policy._src.imaginaire.utils import distributed, log, misc, wandb_util
 from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
 from cosmos_policy._src.imaginaire.utils.parallel_state_helper import is_tp_cp_pp_rank0
 from cosmos_policy._src.imaginaire.visualize.video import save_img_or_video
@@ -247,7 +247,7 @@ class EveryNDrawSample(EveryN):
 
             log.debug("waiting for all ranks to finish", rank0_only=False)
             dist.barrier()
-        if wandb.run:
+        if wandb_util.is_active():
             sample_counter = getattr(trainer, "sample_counter", iteration)
             data_type = "image" if model.is_image_batch(data_batch) else "video"
             tag += f"_{data_type}"
@@ -262,7 +262,7 @@ class EveryNDrawSample(EveryN):
                 info.update({f"x0_pred_mse_{tag}/Sigma{sigmas[i]:0.5f}": mse_loss[i] for i in range(len(mse_loss))})
 
             info[f"{self.name}/{tag}_sample"] = wandb.Image(sample_img_fp, caption=f"{sample_counter}")
-            wandb.log(
+            wandb_util.log(
                 info,
                 step=iteration,
             )
@@ -343,7 +343,7 @@ class EveryNDrawSample(EveryN):
         file_base_fp = f"{base_fp_wo_ext}_resize.jpg"
         local_path = f"{self.local_dir}/{file_base_fp}"
 
-        if self.rank == 0 and wandb.run:
+        if self.rank == 0 and wandb_util.is_active():
             if is_single_frame:  # image case
                 to_show = rearrange(
                     to_show[:, :n_viz_sample],

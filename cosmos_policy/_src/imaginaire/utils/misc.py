@@ -35,11 +35,10 @@ except ImportError:
     straggler = None
 import termcolor
 import torch
-import wandb
 from torch.distributed._functional_collectives import AsyncCollectiveTensor
 from torch.distributed._tensor.api import DTensor
 
-from cosmos_policy._src.imaginaire.utils import distributed, log
+from cosmos_policy._src.imaginaire.utils import distributed, log, wandb_util
 from cosmos_policy._src.imaginaire.utils.distributed import all_gather_tensor
 from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
 from cosmos_policy._src.imaginaire.utils.timer import Timer
@@ -380,7 +379,7 @@ def timeout_handler(timeout_period: float, signum: int, frame: int) -> None:
     # What to do when the process gets stuck. For now, we simply end the process.
     error_message = f"Timeout error: more than {timeout_period} seconds passed since the last iteration."
     if distributed.is_rank0():
-        wandb.alert(title="Timeout error!", text=error_message, level=wandb.AlertLevel.ERROR)
+        wandb_util.alert(title="Timeout error!", text=error_message, level="ERROR")
     raise TimeoutError(error_message)
 
 
@@ -618,8 +617,7 @@ class StragglerDetectorV2:
                             f"slowest_rank/slowest_{key}_time": torch.max(data_tensor).item(),
                         }
                     )
-                if wandb.run:
-                    wandb.log(wandb_info, step=iteration)
+                wandb_util.log(wandb_info, step=iteration)
 
                 import cosmos_policy._src.imaginaire.utils.launch
 

@@ -19,11 +19,10 @@ import sys
 import time
 
 import torch
-import wandb
 from omegaconf import OmegaConf
 
 from cosmos_policy._src.imaginaire.config import Config
-from cosmos_policy._src.imaginaire.utils import distributed, log
+from cosmos_policy._src.imaginaire.utils import distributed, log, wandb_util
 from cosmos_policy._src.imaginaire.utils.cluster_env import get_cluster_env
 from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
 from cosmos_policy._src.imaginaire.utils.env_parsers.cred_env_parser import CRED_ENVS
@@ -126,8 +125,7 @@ def log_reproducible_setup(config: Config, args: argparse.Namespace) -> None:
             OmegaConf.save(job_info, f)
         with open(f"{job_local_path}/launch_info.yaml", "w") as f:
             OmegaConf.save(launch_info, f)
-        if wandb.run:
-            wandb.run.config.update({f"JOB_INFO/{k}": v for k, v in job_info.items()}, allow_val_change=True)
+        wandb_util.update_config({f"JOB_INFO/{k}": v for k, v in job_info.items()}, allow_val_change=True)
 
         # by default, we upload run in ngc and slurm
         if config.upload_reproducible_setup:

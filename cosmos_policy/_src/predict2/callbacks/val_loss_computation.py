@@ -31,11 +31,10 @@ Key Features:
 from functools import partial
 
 import torch
-import wandb
 from megatron.core import parallel_state
 from torch.utils.data import DataLoader
 
-from cosmos_policy._src.imaginaire.utils import distributed, log
+from cosmos_policy._src.imaginaire.utils import distributed, log, wandb_util
 from cosmos_policy._src.predict2.callbacks.every_n_draw_sample import EveryNDrawSample
 from cosmos_policy._src.predict2.datasets.data_sources.item_datasets_for_validation import get_itemdataset_option
 from cosmos_policy._src.predict2.datasets.item_dataset import (
@@ -278,8 +277,8 @@ class ValLossComputation(EveryNDrawSample):
             )
 
             # WandB logging (rank 0 only)
-            if wandb.run and distributed.get_rank() == 0:
-                wandb.log(
+            if distributed.get_rank() == 0:
+                wandb_util.log(
                     {
                         f"val_loss/{tag}": overall_val_loss,
                         f"val_samples/{tag}": total_samples,
@@ -289,7 +288,7 @@ class ValLossComputation(EveryNDrawSample):
 
                 # Log per-noise-level MSE (same format as parent class)
                 for i, sigma_val in enumerate(sigmas):
-                    wandb.log({f"val_mse_{tag}/Sigma{sigma_val:0.5f}": avg_mse_per_noise[i].item()}, step=iteration)
+                    wandb_util.log({f"val_mse_{tag}/Sigma{sigma_val:0.5f}": avg_mse_per_noise[i].item()}, step=iteration)
 
         log.critical(f"ValLoss: {tag} Completed validation loss computation at iteration {iteration}", rank0_only=False)
         distributed.barrier()

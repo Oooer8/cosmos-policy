@@ -24,7 +24,6 @@ import torch
 import torch.distributed as dist
 import torch.utils.data
 import tqdm
-import wandb
 
 from cosmos_policy._src.imaginaire.lazy_config import instantiate
 from cosmos_policy._src.imaginaire.utils import distributed, log, misc, wandb_util
@@ -438,8 +437,9 @@ class WandBCallback(Callback):
         iteration: int = 0,
     ) -> None:  # Log the curent learning rate.
         if iteration % self.config.trainer.logging_iter == 0 and distributed.is_rank0():
-            wandb.log({"optim/lr": scheduler.get_last_lr()[0]}, step=iteration)
-            wandb.log({"optim/grad_scale": grad_scaler.get_scale()}, step=iteration)
+            logged_iteration = iteration + 1
+            wandb_util.log({"optim/lr": scheduler.get_last_lr()[0]}, step=logged_iteration)
+            wandb_util.log({"optim/grad_scale": grad_scaler.get_scale()}, step=logged_iteration)
 
     def on_training_step_end(
         self,
@@ -452,9 +452,9 @@ class WandBCallback(Callback):
         if iteration % self.config.trainer.logging_iter == 0:
             timer_results = self.trainer.training_timer.compute_average_results()
             if distributed.is_rank0():
-                wandb.log({f"timer/{key}": value for key, value in timer_results.items()}, step=iteration)
-                wandb.log({"train/loss": loss}, step=iteration)
-                wandb.log({"iteration": iteration}, step=iteration)
+                wandb_util.log({f"timer/{key}": value for key, value in timer_results.items()}, step=iteration)
+                wandb_util.log({"train/loss": loss}, step=iteration)
+                wandb_util.log({"iteration": iteration}, step=iteration)
             self.trainer.training_timer.reset()
 
     def on_validation_start(
@@ -489,10 +489,10 @@ class WandBCallback(Callback):
         # Log data/stats of validation set to W&B.
         if distributed.is_rank0():
             log.info(f"Validation loss (iteration {iteration}): {loss:4f}")
-            wandb.log({"val/loss": loss}, step=iteration)
+            wandb_util.log({"val/loss": loss}, step=iteration)
 
     def on_train_end(self, model: ImaginaireModel, iteration: int = 0) -> None:
-        wandb.finish()
+        wandb_util.finish()
 
 
 class LowPrecisionCallback(Callback):
