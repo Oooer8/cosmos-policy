@@ -40,12 +40,32 @@ Evaluation
 - `cosmos_policy/experiments/robot/robotwin/template_deploy_policy.py`
 - `cosmos_policy/experiments/robot/robotwin/requirements_robotwin_eval.txt`
 
+## 0. Recommended Path Setup
+
+The commands below assume:
+
+```bash
+export REPO_ROOT=/Users/oooer/ws/cosmos-policy
+export DATA_ROOT=/data
+
+export RAW_ROOT=$DATA_ROOT/robotwin/RoboTwin2.0
+export INPUT_ROOT=$RAW_ROOT/dataset
+export ROBOTWIN_REPO=$DATA_ROOT/robotwin/RoboTwin
+
+export BASE_DATASETS_DIR=$DATA_ROOT/cosmos_datasets
+export OUTPUT_ROOT=$BASE_DATASETS_DIR/RoboTwin-Agilex-Cosmos-Policy
+
+export IMAGINAIRE_OUTPUT_ROOT=$DATA_ROOT/cosmos_runs
+```
+
+If your data disk is mounted somewhere else, only change `DATA_ROOT`.
+
 ## 1. Convert RoboTwin to ALOHA Format
 
 After extracting the RoboTwin archives, the converter expects a layout like:
 
 ```text
-/PATH/TO/ROBOTWIN/
+$INPUT_ROOT/
   <task_name>/
     aloha-agilex_<variant>/
       data/
@@ -57,9 +77,11 @@ After extracting the RoboTwin archives, the converter expects a layout like:
 Run:
 
 ```bash
+cd $REPO_ROOT
+
 python -m cosmos_policy.experiments.robot.aloha.convert_robotwin_agilex_to_aloha \
-  --input_root /PATH/TO/ROBOTWIN \
-  --output_root /PATH/TO/RoboTwin-Agilex-Cosmos-Policy
+  --input_root "$INPUT_ROOT" \
+  --output_root "$OUTPUT_ROOT"
 ```
 
 Useful flags:
@@ -75,7 +97,7 @@ Useful flags:
 The converted dataset will be written to:
 
 ```text
-/PATH/TO/RoboTwin-Agilex-Cosmos-Policy/
+$OUTPUT_ROOT/
   preprocessed/
     train/
     val/
@@ -105,28 +127,33 @@ The converter follows the same alignment as RoboTwin's ACT preprocessing: curren
 Run:
 
 ```bash
+cd $REPO_ROOT
+
 uv run --extra cu128 --group aloha --python 3.10 \
   python -m cosmos_policy.datasets.save_aloha_t5_text_embeddings \
-  --data_dir /PATH/TO/RoboTwin-Agilex-Cosmos-Policy/preprocessed
+  --data_dir "$OUTPUT_ROOT/preprocessed"
 ```
 
 This creates:
 
 ```text
-/PATH/TO/RoboTwin-Agilex-Cosmos-Policy/preprocessed/t5_embeddings.pkl
+$OUTPUT_ROOT/preprocessed/t5_embeddings.pkl
 ```
 
 ## 3. Launch Training
 
-Set `BASE_DATASETS_DIR` to the parent directory that contains `RoboTwin-Agilex-Cosmos-Policy`:
+Set the training roots:
 
 ```bash
-export BASE_DATASETS_DIR=/PATH/TO
+export BASE_DATASETS_DIR=$DATA_ROOT/cosmos_datasets
+export IMAGINAIRE_OUTPUT_ROOT=$DATA_ROOT/cosmos_runs
 ```
 
 Then start training:
 
 ```bash
+cd $REPO_ROOT
+
 uv run --extra cu128 --group aloha --python 3.10 \
   torchrun --nproc_per_node=8 --master_port=12341 -m cosmos_policy.scripts.train \
   --config=cosmos_policy/config/config.py -- \
@@ -136,6 +163,8 @@ uv run --extra cu128 --group aloha --python 3.10 \
 For quick validation before launching a real run:
 
 ```bash
+cd $REPO_ROOT
+
 uv run --extra cu128 --group aloha --python 3.10 \
   torchrun --nproc_per_node=1 --master_port=12341 -m cosmos_policy.scripts.train \
   --config=cosmos_policy/config/config.py --dryrun -- \
@@ -151,6 +180,14 @@ Follow the Docker setup in [SETUP.md](SETUP.md), then install the same dependenc
 ```bash
 uv sync --extra cu128 --group aloha --python 3.10
 ```
+
+If Docker is not available on your cluster, the practical fallback is:
+
+1. create a bare-metal Python 3.10 environment on the server
+2. clone this repo to `$REPO_ROOT`
+3. run the same `uv sync --extra cu128 --group aloha --python 3.10`
+
+The important part is matching the Python package environment, not Docker itself.
 
 ### 4B. RobotWin environment
 
@@ -176,7 +213,7 @@ Example:
 uv run --extra cu128 --group aloha --python 3.10 \
   python -m cosmos_policy.experiments.robot.aloha.deploy \
     --config cosmos_predict2_2b_480p_robotwin_agilex__inference_only \
-    --ckpt_path /PATH/TO/YOUR_ROBOTWIN_CHECKPOINT \
+    --ckpt_path $IMAGINAIRE_OUTPUT_ROOT/cosmos_policy/cosmos_v2_finetune/cosmos_predict2_2b_480p_robotwin_agilex/checkpoints/<YOUR_CHECKPOINT_DIR> \
     --config_file cosmos_policy/config/config.py \
     --use_third_person_image True \
     --use_wrist_image True \
@@ -184,8 +221,8 @@ uv run --extra cu128 --group aloha --python 3.10 \
     --use_proprio True \
     --normalize_proprio True \
     --unnormalize_actions True \
-    --dataset_stats_path /PATH/TO/RoboTwin-Agilex-Cosmos-Policy/preprocessed/dataset_statistics.json \
-    --t5_text_embeddings_path /PATH/TO/RoboTwin-Agilex-Cosmos-Policy/preprocessed/t5_embeddings.pkl \
+    --dataset_stats_path $OUTPUT_ROOT/preprocessed/dataset_statistics.json \
+    --t5_text_embeddings_path $OUTPUT_ROOT/preprocessed/t5_embeddings.pkl \
     --trained_with_image_aug True \
     --chunk_size 50 \
     --num_open_loop_steps 50 \
@@ -203,7 +240,13 @@ uv run --extra cu128 --group aloha --python 3.10 \
 Notes:
 
 - `--ckpt_path` can be a local checkpoint directory or an HF repo, exactly like other Cosmos deploy flows.
-- `--dataset_stats_path` should point to the RobotWin training dataset stats, typically `preprocessed/dataset_statistics.json`.
+- if you used `IMAGINAIRE_OUTPUT_ROOT=$DATA_ROOT/cosmos_runs`, the checkpoint root is typically:
+
+```text
+$IMAGINAIRE_OUTPUT_ROOT/cosmos_policy/cosmos_v2_finetune/cosmos_predict2_2b_480p_robotwin_agilex/checkpoints/
+```
+
+- `--dataset_stats_path` should point to the RobotWin training dataset stats, typically `$OUTPUT_ROOT/preprocessed/dataset_statistics.json`.
 - If you trained a planning model, you can add `--planning_model_config_name` and `--planning_model_ckpt_path` exactly as in ALOHA deploy.
 
 ## 6. Optional Smoke Test Before Touching RobotWin
@@ -213,7 +256,7 @@ If you want to verify the server without a live RobotWin environment, use one co
 ```bash
 uv run --extra cu128 --group aloha --python 3.10 \
   python -m cosmos_policy.experiments.robot.robotwin.smoke_test_robotwin_server \
-    --episode_path /PATH/TO/RoboTwin-Agilex-Cosmos-Policy/preprocessed/val/<task>/<config>/episode0.hdf5 \
+    --episode_path $OUTPUT_ROOT/preprocessed/val/<task>/<config>/episode0.hdf5 \
     --server_endpoint http://127.0.0.1:8777/act
 ```
 
@@ -229,7 +272,7 @@ From the `cosmos-policy` repo:
 
 ```bash
 python -m cosmos_policy.experiments.robot.robotwin.setup_robotwin_eval \
-  --robotwin_repo /PATH/TO/RoboTwin \
+  --robotwin_repo "$ROBOTWIN_REPO" \
   --policy_name CosmosPolicyRemote \
   --server_endpoint http://127.0.0.1:8777/act \
   --input_image_size 224 \
@@ -242,7 +285,7 @@ python -m cosmos_policy.experiments.robot.robotwin.setup_robotwin_eval \
 This writes:
 
 ```text
-/PATH/TO/RoboTwin/policy/CosmosPolicyRemote/
+$ROBOTWIN_REPO/policy/CosmosPolicyRemote/
   deploy_policy.py
   deploy_policy.yml
   eval.sh
@@ -274,7 +317,7 @@ Or drive the same flow from the Cosmos repo:
 
 ```bash
 python -m cosmos_policy.experiments.robot.robotwin.run_robotwin_eval \
-  --robotwin_repo /PATH/TO/RoboTwin \
+  --robotwin_repo "$ROBOTWIN_REPO" \
   --task_name <task_name> \
   --task_config <task_config> \
   --ckpt_setting 1 \
@@ -297,6 +340,17 @@ Without `--execute`, the wrapper only prints the final `eval.sh` command.
 - The trained policy is assumed to output the same action semantics used in the converted training data, namely next-step joint targets compatible with RobotWin `qpos` control.
 - If your RobotWin task expects a different action mode, adjust `action_type` and, if necessary, add a task-side conversion layer before calling `TASK_ENV.take_action()`.
 - This workspace did **not** have a live Cosmos + RobotWin runtime environment during authoring, so the pipeline was implemented statically. Use the smoke test first before running long benchmark jobs.
+- For the path setup used in this document, the main concrete paths are:
+
+```text
+REPO_ROOT=/Users/oooer/ws/cosmos-policy
+RAW_ROOT=/data/robotwin/RoboTwin2.0
+INPUT_ROOT=/data/robotwin/RoboTwin2.0/dataset
+ROBOTWIN_REPO=/data/robotwin/RoboTwin
+BASE_DATASETS_DIR=/data/cosmos_datasets
+OUTPUT_ROOT=/data/cosmos_datasets/RoboTwin-Agilex-Cosmos-Policy
+IMAGINAIRE_OUTPUT_ROOT=/data/cosmos_runs
+```
 
 ## Notes
 

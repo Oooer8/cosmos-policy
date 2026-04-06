@@ -203,6 +203,25 @@ def load_model_state_dict_from_checkpoint(
     if s3_checkpoint_dir is not None:
         s3_checkpoint_dir = str(s3_checkpoint_dir)
     checkpoint_format = "pt" if s3_checkpoint_dir.endswith(".pt") else "dcp"
+
+    def _load_dcp_checkpoint(model_to_load, checkpoint_path: str):
+        if checkpoint_path.rstrip("/").endswith("/model"):
+            model_checkpoint_path = checkpoint_path.rstrip("/")
+        else:
+            model_checkpoint_path = os.path.join(checkpoint_path, "model")
+
+        checkpointer = DistributedCheckpointer(config.checkpoint, config.job, callbacks=None, disable_async=True)
+        storage_reader = checkpointer.get_storage_reader(model_checkpoint_path)
+        load_planner = DefaultLoadPlanner(allow_partial_load=True)
+        if hasattr(load_planner, "set_partial_channel_weight"):
+            load_planner.set_partial_channel_weight(config.checkpoint.dcp_allow_mismatched_size)
+
+        model_wrapper = ModelWrapper(model_to_load, load_ema_to_reg=load_ema_to_reg)
+        state_dict = model_wrapper.state_dict()
+        dcp_load_state_dict(state_dict, storage_reader, load_planner)
+        model_wrapper.load_state_dict(state_dict)
+        return model_to_load
+
     if s3_checkpoint_dir.startswith("s3:"):
         if checkpoint_format == "pt":
             cur_key_ckpt_full_path = s3_checkpoint_dir
@@ -220,6 +239,10 @@ def load_model_state_dict_from_checkpoint(
 
     if SMOKE:
         return model
+
+    if checkpoint_format == "dcp":
+        log.info(f"Loading DCP checkpoint from {cur_key_ckpt_full_path}")
+        return _load_dcp_checkpoint(model, cur_key_ckpt_full_path)
 
     if load_from_local:
         # Load on rank0 only and broadcast
