@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional fallback instruction if TASK_ENV does not expose get_instruction().",
     )
     parser.add_argument(
+        "--instruction_type",
+        default="unseen",
+        help="RobotWin instruction split type expected by script/eval_policy.py (default: unseen).",
+    )
+    parser.add_argument(
         "--return_all_query_results",
         action="store_true",
         help="Request all best-of-N query metadata from the server. Usually keep this off for normal eval.",
@@ -126,6 +131,15 @@ def build_yaml(args: argparse.Namespace) -> str:
         return "\n".join(lines)
 
     parts = [
+        "# Basic experiment configuration (required by RoboTwin eval_policy.py)",
+        "policy_name: null",
+        "task_name: null",
+        "task_config: null",
+        "ckpt_setting: null",
+        "seed: null",
+        f'instruction_type: "{args.instruction_type}"',
+        "",
+        "# Cosmos Policy remote adapter configuration",
         f'server_endpoint: "{args.server_endpoint}"',
         f"request_timeout_sec: {args.request_timeout_sec}",
         f"input_image_size: {args.input_image_size}",

@@ -54,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request_timeout_sec", type=float, default=60.0, help="HTTP timeout for /act.")
     parser.add_argument("--action_type", default="qpos", help="RobotWin action mode.")
     parser.add_argument("--default_task_description", default="", help="Fallback task description.")
+    parser.add_argument(
+        "--instruction_type",
+        default="unseen",
+        help="RobotWin instruction split type passed through deploy_policy.yml (default: unseen).",
+    )
     parser.add_argument("--return_all_query_results", action="store_true", help="Request full best-of-N metadata.")
     parser.add_argument(
         "--allow_action_dim_mismatch",
