@@ -7,10 +7,12 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from queue import Empty, Queue
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
@@ -45,10 +47,12 @@ DEFAULT_TASKS = (
 @dataclass
 class TaskEvalResult:
     task_name: str
+    gpu_id: str
     returncode: int
     success_rate: float | None
     result_file: str | None
     duration_sec: float
+    log_file: str | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,7 +95,13 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Seed stride forwarded to eval_policy.py.",
     )
-    parser.add_argument("--gpu_id", default="0", help="GPU id forwarded to eval_policy.py.")
+    parser.add_argument("--gpu_id", default="0", help="Single GPU id for backward compatibility.")
+    parser.add_argument(
+        "--gpu_ids",
+        nargs="+",
+        default=None,
+        help="Optional GPU pool for parallel batch evaluation, for example --gpu_ids 0 1 2 3.",
+    )
     parser.add_argument(
         "--fail_fast",
         action="store_true",
@@ -193,6 +203,19 @@ def _validate_tasks(robotwin_repo: Path, task_names: tuple[str, ...]) -> None:
         raise FileNotFoundError(f"Task env files not found in RoboTwin for: {missing}")
 
 
+def _normalize_gpu_ids(args: argparse.Namespace) -> tuple[str, ...]:
+    raw_gpu_ids = args.gpu_ids if args.gpu_ids is not None else [args.gpu_id]
+    normalized: list[str] = []
+    for entry in raw_gpu_ids:
+        for piece in str(entry).split(","):
+            text = piece.strip()
+            if text:
+                normalized.append(text)
+    if not normalized:
+        raise SystemExit("At least one GPU id is required.")
+    return tuple(normalized)
+
+
 def _build_eval_command(
     args: argparse.Namespace,
     policy_name: str,
@@ -252,12 +275,23 @@ def _find_latest_result_file(
     policy_name: str,
     task_config: str,
     ckpt_setting: str,
+    not_before: float | None = None,
 ) -> Path | None:
     result_root = robotwin_repo / "eval_result" / task_name / policy_name / task_config / str(ckpt_setting)
     if not result_root.exists():
         return None
-    candidates = sorted(result_root.glob("*/_result.txt"), key=lambda path: path.stat().st_mtime, reverse=True)
-    return candidates[0] if candidates else None
+    candidates = []
+    for path in result_root.glob("*/_result.txt"):
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if not_before is not None and mtime + 1e-6 < not_before:
+            continue
+        candidates.append((mtime, path))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    candidate_paths = [path for _, path in candidates]
+    return candidate_paths[0] if candidate_paths else None
 
 
 def _parse_success_rate(result_file: Path | None) -> float | None:
@@ -278,6 +312,75 @@ def _default_summary_dir(robotwin_repo: Path, policy_name: str, task_config: str
     return robotwin_repo / "eval_result" / "_batch" / policy_name / task_config
 
 
+def _run_task(
+    *,
+    args: argparse.Namespace,
+    robotwin_repo: Path,
+    policy_dir: Path,
+    task_name: str,
+    gpu_id: str,
+    log_dir: Path | None,
+    stream_output: bool,
+) -> TaskEvalResult:
+    command = _build_eval_command(args, args.policy_name, task_name)
+    env = _build_subprocess_env(policy_dir, robotwin_repo, gpu_id)
+    log_file = None if log_dir is None else log_dir / f"{task_name}__gpu{gpu_id}.log"
+
+    print("")
+    print(f"[RobotWin batch][GPU {gpu_id}] {task_name}")
+    print(" ".join(command))
+    if log_file is not None:
+        print(f"Log file: {log_file}")
+
+    if args.print_only:
+        return TaskEvalResult(
+            task_name=task_name,
+            gpu_id=str(gpu_id),
+            returncode=0,
+            success_rate=None,
+            result_file=None,
+            duration_sec=0.0,
+            log_file=str(log_file) if log_file is not None else None,
+        )
+
+    start_time = time.time()
+    if log_file is not None and not stream_output:
+        with open(log_file, "w", encoding="utf-8") as handle:
+            handle.write("$ " + " ".join(command) + "\n\n")
+            handle.flush()
+            completed = subprocess.run(
+                command,
+                cwd=robotwin_repo,
+                env=env,
+                check=False,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+            )
+    else:
+        completed = subprocess.run(command, cwd=robotwin_repo, env=env, check=False)
+    duration_sec = time.time() - start_time
+
+    result_file = _find_latest_result_file(
+        robotwin_repo=robotwin_repo,
+        task_name=task_name,
+        policy_name=args.policy_name,
+        task_config=args.task_config,
+        ckpt_setting=str(args.ckpt_setting),
+        not_before=start_time,
+    )
+    success_rate = _parse_success_rate(result_file)
+
+    return TaskEvalResult(
+        task_name=task_name,
+        gpu_id=str(gpu_id),
+        returncode=completed.returncode,
+        success_rate=success_rate,
+        result_file=str(result_file) if result_file is not None else None,
+        duration_sec=round(duration_sec, 3),
+        log_file=str(log_file) if log_file is not None else None,
+    )
+
+
 def main() -> None:
     args = parse_args()
     robotwin_repo = Path(args.robotwin_repo).expanduser().resolve()
@@ -285,10 +388,10 @@ def main() -> None:
         raise FileNotFoundError(f"RobotWin repo does not exist: {robotwin_repo}")
 
     task_names = tuple(args.task_names) if args.task_names else DEFAULT_TASKS
+    gpu_ids = _normalize_gpu_ids(args)
     _validate_tasks(robotwin_repo, task_names)
 
     policy_dir = install_policy(args)
-    env = _build_subprocess_env(policy_dir, robotwin_repo, args.gpu_id)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     summary_dir = Path(args.summary_dir).expanduser().resolve() if args.summary_dir else _default_summary_dir(
@@ -296,61 +399,97 @@ def main() -> None:
     )
     summary_dir.mkdir(parents=True, exist_ok=True)
     summary_path = summary_dir / f"batch_eval_{timestamp}.json"
+    log_dir = summary_dir / f"batch_eval_{timestamp}_logs"
+    if len(gpu_ids) > 1 and not args.print_only:
+        log_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"RobotWin adapter is ready at: {policy_dir}")
     print(f"Tasks to evaluate ({len(task_names)}): {', '.join(task_names)}")
     print(f"Task config: {args.task_config}")
     print(f"Rollouts per task: {args.rollouts_per_task}")
+    print(f"GPU pool: {', '.join(gpu_ids)}")
     print(f"Batch summary will be written to: {summary_path}")
+    if len(gpu_ids) > 1 and not args.print_only:
+        print(f"Per-task logs will be written under: {log_dir}")
 
     results: list[TaskEvalResult] = []
     failed_tasks: list[str] = []
+    skipped_tasks: list[str] = []
 
-    for task_name in task_names:
-        command = _build_eval_command(args, args.policy_name, task_name)
-        print("")
-        print(f"[RobotWin batch] {task_name}")
-        print(" ".join(command))
-
-        if args.print_only:
-            results.append(
-                TaskEvalResult(
-                    task_name=task_name,
-                    returncode=0,
-                    success_rate=None,
-                    result_file=None,
-                    duration_sec=0.0,
-                )
-            )
-            continue
-
-        start_time = time.time()
-        completed = subprocess.run(command, cwd=robotwin_repo, env=env, check=False)
-        duration_sec = time.time() - start_time
-
-        result_file = _find_latest_result_file(
-            robotwin_repo=robotwin_repo,
-            task_name=task_name,
-            policy_name=args.policy_name,
-            task_config=args.task_config,
-            ckpt_setting=str(args.ckpt_setting),
-        )
-        success_rate = _parse_success_rate(result_file)
-
-        results.append(
-            TaskEvalResult(
+    if len(gpu_ids) == 1 or args.print_only:
+        single_gpu = gpu_ids[0]
+        for task_name in task_names:
+            result = _run_task(
+                args=args,
+                robotwin_repo=robotwin_repo,
+                policy_dir=policy_dir,
                 task_name=task_name,
-                returncode=completed.returncode,
-                success_rate=success_rate,
-                result_file=str(result_file) if result_file is not None else None,
-                duration_sec=round(duration_sec, 3),
+                gpu_id=single_gpu,
+                log_dir=None,
+                stream_output=True,
             )
-        )
+            results.append(result)
+            if result.returncode != 0:
+                failed_tasks.append(task_name)
+                if args.fail_fast:
+                    skipped_tasks = [name for name in task_names if name not in {item.task_name for item in results}]
+                    break
+    else:
+        task_queue: Queue[tuple[int, str]] = Queue()
+        for index, task_name in enumerate(task_names):
+            task_queue.put((index, task_name))
 
-        if completed.returncode != 0:
-            failed_tasks.append(task_name)
-            if args.fail_fast:
+        results_map: dict[int, TaskEvalResult] = {}
+        failed_lock = threading.Lock()
+        stop_launching = threading.Event()
+
+        def worker(gpu_id: str) -> None:
+            while True:
+                if args.fail_fast and stop_launching.is_set():
+                    break
+                try:
+                    index, task_name = task_queue.get_nowait()
+                except Empty:
+                    break
+
+                try:
+                    result = _run_task(
+                        args=args,
+                        robotwin_repo=robotwin_repo,
+                        policy_dir=policy_dir,
+                        task_name=task_name,
+                        gpu_id=gpu_id,
+                        log_dir=log_dir,
+                        stream_output=False,
+                    )
+                    with failed_lock:
+                        results_map[index] = result
+                        if result.returncode != 0:
+                            failed_tasks.append(task_name)
+                            if args.fail_fast:
+                                stop_launching.set()
+                finally:
+                    task_queue.task_done()
+
+        workers = [
+            threading.Thread(target=worker, name=f"robotwin-gpu-{gpu_id}", args=(gpu_id,), daemon=True)
+            for gpu_id in gpu_ids
+        ]
+        for worker_thread in workers:
+            worker_thread.start()
+        for worker_thread in workers:
+            worker_thread.join()
+
+        remaining = []
+        while True:
+            try:
+                _, task_name = task_queue.get_nowait()
+                remaining.append(task_name)
+                task_queue.task_done()
+            except Empty:
                 break
+        skipped_tasks.extend(remaining)
+        results = [results_map[index] for index in sorted(results_map.keys())]
 
     summary = {
         "timestamp": timestamp,
@@ -361,17 +500,20 @@ def main() -> None:
         "seed": args.seed,
         "seed_start": args.seed_start,
         "seed_stride": args.seed_stride,
-        "gpu_id": str(args.gpu_id),
+        "gpu_ids": list(gpu_ids),
         "collect_data": bool(args.collect_data),
         "save_eval_videos": bool(args.save_eval_videos),
         "task_names": list(task_names),
         "failed_tasks": failed_tasks,
+        "skipped_tasks": skipped_tasks,
         "results": [asdict(result) for result in results],
     }
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     print("")
     print(f"Saved batch summary to: {summary_path}")
+    if skipped_tasks:
+        print(f"Skipped tasks: {', '.join(skipped_tasks)}")
     if failed_tasks:
         failed_display = ", ".join(failed_tasks)
         raise SystemExit(f"Batch evaluation finished with failures: {failed_display}")
