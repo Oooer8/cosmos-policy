@@ -73,11 +73,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional fallback instruction if TASK_ENV does not expose get_instruction().",
     )
     parser.add_argument(
-        "--use_fixed_task_description",
+        "--use_task_name_as_instruction",
         action="store_true",
         help=(
-            "If set, ignore RoboTwin's per-episode generated instruction and always use a fixed task-level "
-            "description during evaluation."
+            "If set, ignore RoboTwin's per-episode generated instruction and always use the task name converted "
+            'to plain text, for example "open_microwave" -> "open microwave".'
         ),
     )
     parser.add_argument(
@@ -174,7 +174,7 @@ def build_yaml(args: argparse.Namespace) -> str:
         f'action_type: "{args.action_type}"',
         f"strict_action_dim: {'false' if args.allow_action_dim_mismatch else 'true'}",
         f"swap_bgr_to_rgb: {'true' if args.swap_bgr_to_rgb else 'false'}",
-        f"use_fixed_task_description: {'true' if args.use_fixed_task_description else 'false'}",
+        f"use_task_name_as_instruction: {'true' if args.use_task_name_as_instruction else 'false'}",
         f"sleep_after_action_sec: {args.sleep_after_action_sec}",
         f'default_task_description: "{args.default_task_description}"',
         _yaml_list("primary_image_paths", args.primary_image_path),

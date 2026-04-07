@@ -17,12 +17,10 @@
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Any
 
 import json_numpy
@@ -42,9 +40,6 @@ __all__ = [
     "reset_model",
     "update_obs",
 ]
-
-
-_FIXED_TASK_DESCRIPTION_CACHE: dict[str, str] = {}
 
 
 DEFAULT_PRIMARY_IMAGE_PATHS = [
@@ -109,7 +104,7 @@ def _merge_config(user_args: Any) -> dict[str, Any]:
         "action_type": "qpos",
         "strict_action_dim": True,
         "swap_bgr_to_rgb": False,
-        "use_fixed_task_description": False,
+        "use_task_name_as_instruction": False,
         "sleep_after_action_sec": 0.0,
         "primary_image_paths": list(DEFAULT_PRIMARY_IMAGE_PATHS),
         "left_wrist_image_paths": list(DEFAULT_LEFT_WRIST_IMAGE_PATHS),
@@ -146,7 +141,7 @@ def _merge_config(user_args: Any) -> dict[str, Any]:
     merged["strict_action_dim"] = bool(merged["strict_action_dim"])
     merged["return_all_query_results"] = bool(merged["return_all_query_results"])
     merged["swap_bgr_to_rgb"] = bool(merged["swap_bgr_to_rgb"])
-    merged["use_fixed_task_description"] = bool(merged["use_fixed_task_description"])
+    merged["use_task_name_as_instruction"] = bool(merged["use_task_name_as_instruction"])
     merged["verbose"] = bool(merged["verbose"])
     return merged
 
@@ -225,28 +220,6 @@ def _coerce_float_vector(value: Any) -> np.ndarray:
     return array
 
 
-def _extract_first_string(obj: Any) -> str:
-    if isinstance(obj, str):
-        text = obj.strip()
-        return text if text else ""
-    if isinstance(obj, Mapping):
-        for key in ("full_description", "task_description", "instruction", "language", "prompt", "text", "description"):
-            if key in obj:
-                text = _extract_first_string(obj[key])
-                if text:
-                    return text
-        for value in obj.values():
-            text = _extract_first_string(value)
-            if text:
-                return text
-    if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
-        for item in obj:
-            text = _extract_first_string(item)
-            if text:
-                return text
-    return ""
-
-
 def _infer_task_name(task_env: Any, model: "RemoteRobotWinPolicy", observation: Any) -> str:
     for candidate in (
         model.config.get("task_name"),
@@ -263,27 +236,8 @@ def _infer_task_name(task_env: Any, model: "RemoteRobotWinPolicy", observation: 
     return ""
 
 
-def _resolve_fixed_task_description(task_name: str, config: Mapping[str, Any]) -> str:
-    if config.get("default_task_description"):
-        return str(config["default_task_description"]).strip()
-
-    text = _FIXED_TASK_DESCRIPTION_CACHE.get(task_name, "")
-    if text:
-        return text
-
-    repo_root = Path(__file__).resolve().parents[2]
-    task_instruction_path = repo_root / "description" / "task_instruction" / f"{task_name}.json"
-    if task_instruction_path.exists():
-        with open(task_instruction_path, "r", encoding="utf-8") as file:
-            task_data = json.load(file)
-        text = _extract_first_string(task_data)
-
-    if not text and task_name:
-        text = task_name.replace("_", " ")
-
-    if text:
-        _FIXED_TASK_DESCRIPTION_CACHE[task_name] = text
-    return text
+def _task_name_to_instruction(task_name: str) -> str:
+    return " ".join(part for part in str(task_name).strip().split("_") if part)
 
 
 def _compose_joint_state_from_prefix(root: Any, prefix: str) -> np.ndarray | None:
@@ -454,13 +408,15 @@ def reset_model(model: RemoteRobotWinPolicy) -> None:
 
 
 def _get_task_instruction(task_env: Any, model: RemoteRobotWinPolicy, observation: Any) -> str:
-    if model.config["use_fixed_task_description"]:
+    if model.config["use_task_name_as_instruction"]:
         task_name = _infer_task_name(task_env, model, observation)
-        text = _resolve_fixed_task_description(task_name, model.config)
+        text = _task_name_to_instruction(task_name)
         if text:
             return text
+        if model.config["default_task_description"]:
+            return str(model.config["default_task_description"]).strip()
         raise ValueError(
-            "use_fixed_task_description is enabled, but the adapter could not resolve a task-level description. "
+            "use_task_name_as_instruction is enabled, but the adapter could not resolve task_name. "
             "Set default_task_description explicitly or ensure task_name is available."
         )
 

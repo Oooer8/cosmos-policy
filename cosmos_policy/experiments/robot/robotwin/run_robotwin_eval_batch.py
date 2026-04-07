@@ -150,11 +150,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action_type", default="qpos", help="RobotWin action mode.")
     parser.add_argument("--default_task_description", default="", help="Fallback task description.")
     parser.add_argument(
-        "--use_fixed_task_description",
+        "--use_task_name_as_instruction",
         action="store_true",
         help=(
-            "If set, ignore RoboTwin's per-episode generated instruction and always use a fixed task-level "
-            "description during evaluation."
+            "If set, ignore RoboTwin's per-episode generated instruction and always use the task name converted "
+            'to plain text, for example "open_microwave" -> "open microwave".'
         ),
     )
     parser.add_argument(
