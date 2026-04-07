@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_open_loop_steps",
         type=int,
-        default=50,
+        default=10,
         help="Client-side open-loop chunk length before re-querying /act.",
     )
     parser.add_argument("--request_timeout_sec", type=float, default=60.0, help="HTTP timeout for /act.")
