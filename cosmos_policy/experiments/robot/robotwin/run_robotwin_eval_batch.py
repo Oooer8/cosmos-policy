@@ -140,6 +140,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action_type", default="qpos", help="RobotWin action mode.")
     parser.add_argument("--default_task_description", default="", help="Fallback task description.")
     parser.add_argument(
+        "--use_fixed_task_description",
+        action="store_true",
+        help=(
+            "If set, ignore RoboTwin's per-episode generated instruction and always use a fixed task-level "
+            "description during evaluation."
+        ),
+    )
+    parser.add_argument(
         "--instruction_type",
         default="unseen",
         help="RobotWin instruction split type passed through deploy_policy.yml.",
