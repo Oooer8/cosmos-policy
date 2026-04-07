@@ -31,6 +31,16 @@ from PIL import Image
 
 json_numpy.patch()
 
+__all__ = [
+    "RemoteRobotWinPolicy",
+    "encode_obs",
+    "eval",
+    "get_action",
+    "get_model",
+    "reset_model",
+    "update_obs",
+]
+
 
 DEFAULT_PRIMARY_IMAGE_PATHS = [
     "primary_image",
@@ -88,6 +98,7 @@ def _merge_config(user_args: Any) -> dict[str, Any]:
         "server_endpoint": os.environ.get("COSMOS_POLICY_SERVER_ENDPOINT", "http://127.0.0.1:8777/act"),
         "request_timeout_sec": float(os.environ.get("COSMOS_POLICY_REQUEST_TIMEOUT_SEC", "60")),
         "input_image_size": 224,
+        # Client-side re-query cadence. The server still returns the full model chunk.
         "num_open_loop_steps": 50,
         "return_all_query_results": False,
         "action_type": "qpos",

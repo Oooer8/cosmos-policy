@@ -222,7 +222,7 @@ class DeployConfig:
     t5_text_embeddings_path: str = ""                                    # Path to precomputed T5 text embeddings dictionary (key: instruction, val: embedding)
     trained_with_image_aug: bool = True                                  # Whether the model was trained with image augmentations (needed for test-time image transformations)
     chunk_size: int = 50                                                 # Number of actions to predict in chunk
-    num_open_loop_steps: int = 50                                        # Number of actions in predicted chunk to execute open-loop before requerying policy
+    num_open_loop_steps: int = 50                                        # Kept for compatibility with ALOHA eval configs; remote clients may choose their own re-query cadence
 
     deterministic: bool = True                                           # Whether to run in deterministic mode
 

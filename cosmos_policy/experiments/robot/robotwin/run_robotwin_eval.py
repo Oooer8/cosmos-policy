@@ -50,7 +50,12 @@ def parse_args() -> argparse.Namespace:
         help="Cosmos Policy server endpoint exposed by aloha.deploy.",
     )
     parser.add_argument("--input_image_size", type=int, default=224, help="Square image size sent to the server.")
-    parser.add_argument("--num_open_loop_steps", type=int, default=50, help="Open-loop chunk length.")
+    parser.add_argument(
+        "--num_open_loop_steps",
+        type=int,
+        default=50,
+        help="Client-side open-loop chunk length before re-querying /act.",
+    )
     parser.add_argument("--request_timeout_sec", type=float, default=60.0, help="HTTP timeout for /act.")
     parser.add_argument("--action_type", default="qpos", help="RobotWin action mode.")
     parser.add_argument("--default_task_description", default="", help="Fallback task description.")

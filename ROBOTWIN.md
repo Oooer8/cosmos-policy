@@ -225,7 +225,6 @@ uv run --extra cu128 --group aloha --python 3.10 \
     --t5_text_embeddings_path $OUTPUT_ROOT/preprocessed/t5_embeddings.pkl \
     --trained_with_image_aug True \
     --chunk_size 50 \
-    --num_open_loop_steps 50 \
     --ar_future_prediction False \
     --ar_value_prediction False \
     --use_jpeg_compression False \
@@ -240,6 +239,7 @@ uv run --extra cu128 --group aloha --python 3.10 \
 Notes:
 
 - `--ckpt_path` can be a local checkpoint directory or an HF repo, exactly like other Cosmos deploy flows.
+- For RobotWin, `--chunk_size` belongs to the server/model side. The client-side re-query cadence is configured separately through `setup_robotwin_eval --num_open_loop_steps` or `deploy_policy.yml`.
 - if you used `IMAGINAIRE_OUTPUT_ROOT=$DATA_ROOT/cosmos_runs`, the checkpoint root is typically:
 
 ```text
@@ -282,14 +282,21 @@ python -m cosmos_policy.experiments.robot.robotwin.setup_robotwin_eval \
   --overwrite
 ```
 
+`--num_open_loop_steps` is a client-side setting: the adapter will execute only that many actions from each server response before fetching fresh RobotWin observations and querying `/act` again.
+
 This writes:
 
 ```text
 $ROBOTWIN_REPO/policy/CosmosPolicyRemote/
   deploy_policy.py
+  __init__.py
+  CosmosPolicyRemote.py
   deploy_policy.yml
   eval.sh
   README.md
+
+$ROBOTWIN_REPO/
+  CosmosPolicyRemote.py
 ```
 
 If RobotWin observation keys differ from the defaults, you can override them while installing:
@@ -330,7 +337,13 @@ python -m cosmos_policy.experiments.robot.robotwin.run_robotwin_eval \
 
 Without `--execute`, the wrapper only prints the final `eval.sh` command.
 
-## 9. Assumptions and Compatibility Notes
+## 9. Troubleshooting
+
+- If you see `module 'CosmosPolicyRemote' has no attribute 'get_model'`, first confirm that `ROBOTWIN_REPO` points to the RoboTwin checkout containing `script/eval_policy.py`, not the `cosmos-policy` repo. The installer now checks this explicitly.
+- Re-run `setup_robotwin_eval --overwrite` after updating this repo so the compatibility shims are regenerated.
+- The generated `eval.sh` now exports a broader `PYTHONPATH` and performs a small import self-check before launching `script/eval_policy.py`, which makes RobotWin loader differences less brittle.
+
+## 10. Assumptions and Compatibility Notes
 
 - This evaluation path targets **RoboTwin 2.0 `aloha-agilex` only**.
 - The adapter assumes the same observation layout used during training:

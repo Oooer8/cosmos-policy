@@ -23,6 +23,15 @@ from pathlib import Path
 
 
 DEFAULT_POLICY_NAME = "CosmosPolicyRemote"
+EXPORTED_POLICY_SYMBOLS = (
+    "RemoteRobotWinPolicy",
+    "encode_obs",
+    "eval",
+    "get_action",
+    "get_model",
+    "reset_model",
+    "update_obs",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,6 +130,14 @@ def _template_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _format_symbol_block(indent: str = "    ") -> str:
+    return "\n".join(f"{indent}{symbol}," for symbol in EXPORTED_POLICY_SYMBOLS)
+
+
+def _format_symbol_list() -> str:
+    return ", ".join(f'"{symbol}"' for symbol in EXPORTED_POLICY_SYMBOLS)
+
+
 def build_yaml(args: argparse.Namespace) -> str:
     def _yaml_list(name: str, values: list[str] | None) -> str:
         if not values:
@@ -143,6 +160,7 @@ def build_yaml(args: argparse.Namespace) -> str:
         f'server_endpoint: "{args.server_endpoint}"',
         f"request_timeout_sec: {args.request_timeout_sec}",
         f"input_image_size: {args.input_image_size}",
+        "# Client-side open-loop execution length before the adapter re-queries /act",
         f"num_open_loop_steps: {args.num_open_loop_steps}",
         f"return_all_query_results: {'true' if args.return_all_query_results else 'false'}",
         f'action_type: "{args.action_type}"',
@@ -156,6 +174,42 @@ def build_yaml(args: argparse.Namespace) -> str:
         _yaml_list("proprio_paths", args.proprio_path),
     ]
     return "\n".join(part for part in parts if part) + "\n"
+
+
+def build_package_init() -> str:
+    return (
+        '"""Compatibility exports for RobotWin policy loading."""\n\n'
+        "from .deploy_policy import (\n"
+        f"{_format_symbol_block()}\n"
+        ")\n\n"
+        f"__all__ = [{_format_symbol_list()}]\n"
+    )
+
+
+def build_policy_local_shim() -> str:
+    return (
+        '"""Compatibility shim for loaders that add this policy directory to ``PYTHONPATH``."""\n\n'
+        "from deploy_policy import (\n"
+        f"{_format_symbol_block()}\n"
+        ")\n\n"
+        f"__all__ = [{_format_symbol_list()}]\n"
+    )
+
+
+def build_repo_root_shim(policy_name: str) -> str:
+    return (
+        f'"""Compatibility shim for loaders that import ``{policy_name}`` from the RoboTwin repo root."""\n\n'
+        "from __future__ import annotations\n\n"
+        "import sys\n"
+        "from pathlib import Path\n\n"
+        f'_POLICY_DIR = Path(__file__).resolve().parent / "policy" / "{policy_name}"\n'
+        "if str(_POLICY_DIR) not in sys.path:\n"
+        "    sys.path.insert(0, str(_POLICY_DIR))\n\n"
+        "from deploy_policy import (\n"
+        f"{_format_symbol_block()}\n"
+        ")\n\n"
+        f"__all__ = [{_format_symbol_list()}]\n"
+    )
 
 
 def build_eval_sh(policy_name: str) -> str:
@@ -174,6 +228,23 @@ echo -e "\\033[33mgpu id (to use): ${{gpu_id}}\\033[0m"
 
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 cd "${{SCRIPT_DIR}}/../.."
+export PYTHONPATH="${{SCRIPT_DIR}}:${{SCRIPT_DIR}}/..:${{SCRIPT_DIR}}/../..${{PYTHONPATH:+:${{PYTHONPATH}}}}"
+
+python - "${{policy_name}}" <<'PY'
+import importlib
+import sys
+
+policy_name = sys.argv[1]
+policy_module = importlib.import_module(policy_name)
+required_symbols = ("get_model", "eval", "update_obs")
+missing_symbols = [name for name in required_symbols if not hasattr(policy_module, name)]
+if missing_symbols:
+    module_path = getattr(policy_module, "__file__", "<namespace package>")
+    raise SystemExit(
+        f"Policy module {{policy_name}} loaded from {{module_path}} is missing required exports: {{missing_symbols}}"
+    )
+print(f"Loaded policy module {{policy_name}} from {{getattr(policy_module, '__file__', '<namespace package>')}}")
+PY
 
 PYTHONWARNINGS=ignore::UserWarning \\
 python script/eval_policy.py \\
@@ -196,8 +267,11 @@ query a remote Cosmos Policy server over HTTP.
 ## Files
 
 - `deploy_policy.py`: RobotWin policy adapter
+- `__init__.py`: package-style exports for RobotWin loaders
+- `{args.policy_name}.py`: compatibility shim when the policy directory itself is on `PYTHONPATH`
 - `deploy_policy.yml`: adapter configuration
 - `eval.sh`: convenience wrapper around `python script/eval_policy.py`
+- `{args.policy_name}.py` in the RoboTwin repo root: compatibility shim when the repo root is on `PYTHONPATH`
 
 ## Expected Server
 
@@ -221,6 +295,14 @@ def install_policy(args: argparse.Namespace) -> Path:
     if not robotwin_repo.exists():
         raise FileNotFoundError(f"RobotWin repo does not exist: {robotwin_repo}")
 
+    eval_policy_path = robotwin_repo / "script" / "eval_policy.py"
+    if not eval_policy_path.exists():
+        raise FileNotFoundError(
+            "Expected RobotWin entrypoint at "
+            f"{eval_policy_path}, but it was not found. Double-check that --robotwin_repo points to the RoboTwin "
+            "checkout rather than the cosmos-policy repo."
+        )
+
     policy_root = robotwin_repo / "policy"
     if not policy_root.exists():
         raise FileNotFoundError(
@@ -238,11 +320,14 @@ def install_policy(args: argparse.Namespace) -> Path:
     policy_dir.mkdir(parents=True, exist_ok=True)
 
     shutil.copy2(_template_dir() / "template_deploy_policy.py", policy_dir / "deploy_policy.py")
+    (policy_dir / "__init__.py").write_text(build_package_init(), encoding="utf-8")
+    (policy_dir / f"{args.policy_name}.py").write_text(build_policy_local_shim(), encoding="utf-8")
     (policy_dir / "deploy_policy.yml").write_text(build_yaml(args), encoding="utf-8")
     eval_path = policy_dir / "eval.sh"
     eval_path.write_text(build_eval_sh(args.policy_name), encoding="utf-8")
     eval_path.chmod(0o755)
     (policy_dir / "README.md").write_text(build_readme(args), encoding="utf-8")
+    (robotwin_repo / f"{args.policy_name}.py").write_text(build_repo_root_shim(args.policy_name), encoding="utf-8")
     return policy_dir
 
 
