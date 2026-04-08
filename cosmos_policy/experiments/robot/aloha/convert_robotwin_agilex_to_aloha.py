@@ -147,8 +147,32 @@ def _extract_first_string(obj) -> str:
     if isinstance(obj, str):
         text = obj.strip()
         return text if text else ""
+    if isinstance(obj, bytes):
+        try:
+            text = obj.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return ""
+        return text if text else ""
+    if isinstance(obj, np.ndarray):
+        if obj.ndim == 0:
+            return _extract_first_string(obj.item())
+        if obj.dtype.kind in {"S", "U", "O"}:
+            for item in obj.reshape(-1):
+                text = _extract_first_string(item)
+                if text:
+                    return text
+        return ""
     if isinstance(obj, dict):
-        for key in ("task_description", "instruction", "language", "prompt", "text", "description"):
+        for key in (
+            "task_description",
+            "instruction",
+            "language_instruction",
+            "language",
+            "prompt",
+            "text",
+            "description",
+            "instructions",
+        ):
             if key in obj:
                 text = _extract_first_string(obj[key])
                 if text:
@@ -157,7 +181,7 @@ def _extract_first_string(obj) -> str:
             text = _extract_first_string(value)
             if text:
                 return text
-    if isinstance(obj, list):
+    if isinstance(obj, (list, tuple)):
         for item in obj:
             text = _extract_first_string(item)
             if text:
@@ -165,9 +189,9 @@ def _extract_first_string(obj) -> str:
     return ""
 
 
-def load_instruction_lookup(input_root: str, explicit_root: str) -> dict[str, str]:
+def load_instruction_lookup(instruction_roots: list[str]) -> dict[str, str]:
     instruction_lookup = {}
-    for root in _candidate_instruction_roots(input_root, explicit_root):
+    for root in instruction_roots:
         for filename in sorted(os.listdir(root)):
             if not filename.endswith(".json"):
                 continue
@@ -181,6 +205,79 @@ def load_instruction_lookup(input_root: str, explicit_root: str) -> dict[str, st
             if text:
                 instruction_lookup[os.path.splitext(filename)[0]] = text
     return instruction_lookup
+
+
+def _extract_instruction_from_hdf5(root: h5py.File) -> str:
+    for key in (
+        "task_description",
+        "instruction",
+        "language_instruction",
+        "language",
+        "prompt",
+        "description",
+        "text",
+    ):
+        if key in root.attrs:
+            text = _extract_first_string(root.attrs[key])
+            if text:
+                return text
+
+    dataset = _find_dataset(
+        root,
+        [
+            ("task_description",),
+            ("instruction",),
+            ("language_instruction",),
+            ("language",),
+            ("prompt",),
+            ("description",),
+            ("text",),
+            ("meta", "task_description"),
+            ("observation", "task_description"),
+            ("observations", "task_description"),
+        ],
+    )
+    if dataset is None:
+        return ""
+    return _extract_first_string(dataset[()])
+
+
+def _load_instruction_text_from_json(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except Exception:
+        return ""
+    return _extract_first_string(data)
+
+
+def _candidate_instruction_paths_for_episode(
+    episode_path: str,
+    task_name: str,
+    task_config: str,
+    instruction_roots: list[str],
+) -> list[str]:
+    episode_name = os.path.splitext(os.path.basename(episode_path))[0]
+    task_config_dir = os.path.dirname(os.path.dirname(os.path.abspath(episode_path)))
+    candidate_dirs = [os.path.join(task_config_dir, "instructions")]
+    for root in instruction_roots:
+        candidate_dirs.extend(
+            [
+                os.path.join(root, task_name, task_config),
+                os.path.join(root, task_name),
+                os.path.join(root, task_config),
+                root,
+            ]
+        )
+
+    candidate_paths = []
+    seen_paths = set()
+    for directory in candidate_dirs:
+        path = os.path.abspath(os.path.join(directory, f"{episode_name}.json"))
+        if path not in seen_paths:
+            seen_paths.add(path)
+            candidate_paths.append(path)
+    return candidate_paths
 
 
 def discover_robotwin_episode_groups(input_root: str, embodiment_prefix: str, task_names: set[str] | None):
@@ -285,6 +382,7 @@ def _load_robotwin_joint_state(root: h5py.File) -> np.ndarray:
 
 def load_robotwin_episode(episode_path: str, resize_size: int) -> dict:
     with h5py.File(episode_path, "r") as root:
+        source_task_description = _extract_instruction_from_hdf5(root)
         state = _load_robotwin_joint_state(root)
         camera_datasets = {}
         for camera_name in CAMERA_OUTPUT_NAMES:
@@ -327,16 +425,29 @@ def load_robotwin_episode(episode_path: str, resize_size: int) -> dict:
         "relative_action": relative_action,
         "images": image_dict,
         "num_steps": qpos.shape[0],
+        "source_task_description": source_task_description,
     }
 
 
-def save_aloha_episode(output_path: str, episode_data: dict, task_description: str, source_episode_path: str):
+def save_aloha_episode(
+    output_path: str,
+    episode_data: dict,
+    task_name: str,
+    task_config: str,
+    task_description: str,
+    source_episode_path: str,
+    instruction_source: str,
+):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     num_steps = int(episode_data["num_steps"])
 
     with h5py.File(output_path, "w", rdcc_nbytes=1024**2 * 2) as root:
         root.attrs["sim"] = True
         root.attrs["task_description"] = task_description
+        root.attrs["instruction"] = task_description
+        root.attrs["task_name"] = task_name
+        root.attrs["task_config"] = task_config
+        root.attrs["instruction_source"] = instruction_source
         root.attrs["source_episode_path"] = source_episode_path
 
         obs = root.create_group("observations")
@@ -362,10 +473,34 @@ def save_aloha_episode(output_path: str, episode_data: dict, task_description: s
         root.attrs["num_steps"] = num_steps
 
 
-def get_task_description(task_name: str, instruction_lookup: dict[str, str]) -> str:
+def get_task_description(
+    task_name: str,
+    task_config: str,
+    episode_path: str,
+    instruction_roots: list[str],
+    instruction_lookup: dict[str, str],
+    source_task_description: str,
+) -> tuple[str, str]:
+    for instruction_path in _candidate_instruction_paths_for_episode(
+        episode_path=episode_path,
+        task_name=task_name,
+        task_config=task_config,
+        instruction_roots=instruction_roots,
+    ):
+        if not os.path.isfile(instruction_path):
+            continue
+        text = _load_instruction_text_from_json(instruction_path)
+        if text:
+            return text, instruction_path
+
+    if source_task_description:
+        return source_task_description, "source_hdf5"
+
+    if task_config in instruction_lookup:
+        return instruction_lookup[task_config], f"task_lookup:{task_config}"
     if task_name in instruction_lookup:
-        return instruction_lookup[task_name]
-    return task_name.replace("_", " ")
+        return instruction_lookup[task_name], f"task_lookup:{task_name}"
+    return task_name.replace("_", " "), "task_name_fallback"
 
 
 def convert_split(
@@ -373,6 +508,7 @@ def convert_split(
     grouped_episode_paths: dict[tuple[str, str], list[str]],
     split_indices: dict[tuple[str, str], tuple[list[str], list[str]]],
     output_root: str,
+    instruction_roots: list[str],
     instruction_lookup: dict[str, str],
     resize_size: int,
     overwrite: bool,
@@ -387,7 +523,6 @@ def convert_split(
             iterable.append((key, episode_path))
 
     for (task_name, task_config), episode_path in tqdm(iterable, desc=f"Converting {split_name} episodes"):
-        task_description = get_task_description(task_name, instruction_lookup)
         relative_dir = os.path.join(task_name, task_config)
         output_dir = os.path.join(preprocessed_root, relative_dir)
         output_path = os.path.join(output_dir, os.path.basename(episode_path))
@@ -406,12 +541,29 @@ def convert_split(
             continue
 
         episode_data = load_robotwin_episode(episode_path, resize_size=resize_size)
-        save_aloha_episode(output_path, episode_data, task_description, episode_path)
+        task_description, instruction_source = get_task_description(
+            task_name=task_name,
+            task_config=task_config,
+            episode_path=episode_path,
+            instruction_roots=instruction_roots,
+            instruction_lookup=instruction_lookup,
+            source_task_description=episode_data["source_task_description"],
+        )
+        save_aloha_episode(
+            output_path=output_path,
+            episode_data=episode_data,
+            task_name=task_name,
+            task_config=task_config,
+            task_description=task_description,
+            source_episode_path=episode_path,
+            instruction_source=instruction_source,
+        )
         split_metadata.append(
             {
                 "task_name": task_name,
                 "task_config": task_config,
                 "task_description": task_description,
+                "instruction_source": instruction_source,
                 "source_episode_path": episode_path,
                 "output_episode_path": output_path,
                 "split": split_name,
@@ -425,7 +577,8 @@ def convert_split(
 
 def main(args):
     task_name_filter = set(args.task_names) if args.task_names else None
-    instruction_lookup = load_instruction_lookup(args.input_root, args.instructions_root)
+    instruction_roots = _candidate_instruction_roots(args.input_root, args.instructions_root)
+    instruction_lookup = load_instruction_lookup(instruction_roots)
     grouped_episode_paths = discover_robotwin_episode_groups(
         input_root=args.input_root,
         embodiment_prefix=args.embodiment_prefix,
@@ -453,6 +606,7 @@ def main(args):
         grouped_episode_paths=grouped_episode_paths,
         split_indices=split_indices,
         output_root=output_root,
+        instruction_roots=instruction_roots,
         instruction_lookup=instruction_lookup,
         resize_size=args.img_resize_size,
         overwrite=args.overwrite,
@@ -462,6 +616,7 @@ def main(args):
         grouped_episode_paths=grouped_episode_paths,
         split_indices=split_indices,
         output_root=output_root,
+        instruction_roots=instruction_roots,
         instruction_lookup=instruction_lookup,
         resize_size=args.img_resize_size,
         overwrite=args.overwrite,

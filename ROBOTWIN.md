@@ -106,6 +106,10 @@ $OUTPUT_ROOT/
     dataset_statistics_post_norm.json
 ```
 
+When the raw RoboTwin layout includes per-episode language files at
+`<task_name>/<task_config>/instructions/episode*.json`, the converter now uses those
+instructions for `attrs["task_description"]` instead of falling back to the task name.
+
 Each converted episode contains:
 
 ```text
@@ -118,6 +122,7 @@ Each converted episode contains:
 /observations/images/cam_left_wrist
 /observations/images/cam_right_wrist
 attrs["task_description"]
+attrs["instruction"]
 ```
 
 The converter follows the same alignment as RoboTwin's ACT preprocessing: current state becomes `qpos`, next state becomes `action`.
