@@ -13,11 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cosmos_policy._src.imaginaire.functional.lr_scheduler import LambdaLinearScheduler
+from cosmos_policy._src.imaginaire.functional.lr_scheduler import LambdaLinearScheduler, LambdaWarmUpCosineScheduler
 from cosmos_policy._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_policy._src.imaginaire.lazy_config import LazyDict
 
 LambdaLinearSchedulerConfig: LazyDict = L(LambdaLinearScheduler)(
+    warm_up_steps=[1000],
+    cycle_lengths=[10000000000000],
+    f_start=[1.0e-6],
+    f_max=[1.0],
+    f_min=[1.0],
+)
+
+LambdaWarmUpCosineSchedulerConfig: LazyDict = L(LambdaWarmUpCosineScheduler)(
     warm_up_steps=[1000],
     cycle_lengths=[10000000000000],
     f_start=[1.0e-6],

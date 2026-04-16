@@ -15,9 +15,10 @@
 
 from hydra.core.config_store import ConfigStore
 
-from cosmos_policy._src.imaginaire.configs.lr_scheduler import LambdaLinearSchedulerConfig
+from cosmos_policy._src.imaginaire.configs.lr_scheduler import LambdaLinearSchedulerConfig, LambdaWarmUpCosineSchedulerConfig
 
 
 def register_scheduler():
     cs = ConfigStore.instance()
     cs.store(group="scheduler", package="scheduler", name="lambdalinear", node=LambdaLinearSchedulerConfig)
+    cs.store(group="scheduler", package="scheduler", name="lambdacosine", node=LambdaWarmUpCosineSchedulerConfig)
