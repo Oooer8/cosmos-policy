@@ -58,13 +58,19 @@ OVERWRITE="${OVERWRITE:-0}"
 SHARD_ROOT="${SHARD_ROOT:-${OUTPUT_ROOT%/}__shards}"
 LOG_ROOT="${LOG_ROOT:-${SHARD_ROOT}/logs}"
 MERGE_MODE="${MERGE_MODE:-move}"
+STATUS_ROOT="${LOG_ROOT}/status"
 
 if [[ ! -d "$INPUT_ROOT" ]]; then
   echo "INPUT_ROOT does not exist: $INPUT_ROOT" >&2
   exit 1
 fi
 
-mkdir -p "$SHARD_ROOT" "$LOG_ROOT"
+if [[ "$MERGE_MODE" != "move" && "$MERGE_MODE" != "copy" ]]; then
+  echo "MERGE_MODE must be either 'move' or 'copy', got: $MERGE_MODE" >&2
+  exit 1
+fi
+
+mkdir -p "$SHARD_ROOT" "$LOG_ROOT" "$STATUS_ROOT"
 
 declare -a TASKS
 if [[ "$#" -gt 0 ]]; then
@@ -128,21 +134,65 @@ run_one_task() {
 }
 
 active_jobs=0
-for task_name in "${TASKS[@]}"; do
-  while [[ "$active_jobs" -ge "$MAX_JOBS" ]]; do
-    wait -n
-    active_jobs=$((active_jobs - 1))
-  done
+failed_jobs=0
+
+launch_one_task() {
+  local task_name="$1"
+  local status_path="${STATUS_ROOT}/${task_name}.status"
 
   echo "Launching task: $task_name"
-  run_one_task "$task_name" &
+  printf 'running\n' >"$status_path"
+  (
+    set +e
+    run_one_task "$task_name"
+    status=$?
+    printf '%s\n' "$status" >"$status_path"
+    exit "$status"
+  ) &
   active_jobs=$((active_jobs + 1))
+}
+
+wait_for_one_task() {
+  if wait -n; then
+    :
+  else
+    failed_jobs=$((failed_jobs + 1))
+  fi
+  active_jobs=$((active_jobs - 1))
+}
+
+for task_name in "${TASKS[@]}"; do
+  while [[ "$active_jobs" -ge "$MAX_JOBS" ]]; do
+    wait_for_one_task
+  done
+
+  launch_one_task "$task_name"
 done
 
 while [[ "$active_jobs" -gt 0 ]]; do
-  wait -n
-  active_jobs=$((active_jobs - 1))
+  wait_for_one_task
 done
+
+declare -a FAILED_TASKS=()
+for task_name in "${TASKS[@]}"; do
+  status_path="${STATUS_ROOT}/${task_name}.status"
+  if [[ ! -f "$status_path" ]]; then
+    FAILED_TASKS+=("${task_name} (missing status)")
+    continue
+  fi
+
+  status="$(<"$status_path")"
+  if [[ "$status" != "0" ]]; then
+    FAILED_TASKS+=("${task_name} (exit ${status})")
+  fi
+done
+
+if [[ "${#FAILED_TASKS[@]}" -gt 0 ]]; then
+  echo "One or more task conversions failed; skipping merge." >&2
+  printf '  - %s\n' "${FAILED_TASKS[@]}" >&2
+  echo "Inspect per-task logs under: ${LOG_ROOT}/<task_name>.log" >&2
+  exit 1
+fi
 
 echo "All task conversions completed. Starting merge."
 
@@ -271,7 +321,3 @@ Notes:
   - Generate t5_embeddings.pkl only after the merged dataset is ready.
   - If you rerun into the same OUTPUT_ROOT, this script will refuse to overwrite merged task directories.
 EOF
-if [[ "$MERGE_MODE" != "move" && "$MERGE_MODE" != "copy" ]]; then
-  echo "MERGE_MODE must be either 'move' or 'copy', got: $MERGE_MODE" >&2
-  exit 1
-fi
