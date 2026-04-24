@@ -6,29 +6,59 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
 RAW_ROOT="${RAW_ROOT:-./raw_data}"
 REPO="TianxingChen/RoboTwin2.0"
-MAX_JOBS=4
+MAX_JOBS=20
 
 tasks=(
   adjust_bottle
+  beat_block_hammer
+  blocks_ranking_rgb
+  blocks_ranking_size
   click_alarmclock
+  click_bell
+  dump_bin_bigbin
   grab_roller
   handover_block
+  handover_mic
+  hanging_mug
   lift_pot
+  move_can_pot
+  move_pillbottle_pad
+  move_playingcard_away
+  move_stapler_pad
+  open_laptop
   open_microwave
   pick_diverse_bottles
   pick_dual_bottles
+  place_a2b_left
+  place_a2b_right
   place_bread_basket
   place_bread_skillet
+  place_burger_fries
+  place_can_basket
+  place_cans_plasticbox
+  place_container_plate
+  place_dual_shoes
   place_empty_cup
+  place_fan
+  place_mouse_pad
+  place_object_basket
+  place_object_scale
+  place_object_stand
   place_phone_stand
+  place_shoe
   press_stapler
+  put_bottles_dustbin
   put_object_cabinet
+  rotate_qrcode
   scan_object
   shake_bottle
+  shake_bottle_horizontally
   stack_blocks_three
   stack_blocks_two
+  stack_bowls_three
   stack_bowls_two
   stamp_seal
+  turn_switch
 )
 
 # ── 颜色输出 ──────────────────────────────────────────────
@@ -73,7 +103,7 @@ export RAW_ROOT REPO LOG_DIR GREEN RED YELLOW NC
 # ── 构造任务列表：task x config 笛卡尔积 ─────────────────
 CONFIGS=(
   "aloha-agilex_clean_50.zip"
-  "aloha-agilex_randomized_500.zip"
+  # "aloha-agilex_randomized_500.zip"
 )
 
 job_list=()
