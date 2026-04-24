@@ -24,6 +24,7 @@ Optional environment variables:
   EMBODIMENT_PREFIX        Passed to converter. Default: aloha-agilex
   INSTRUCTIONS_ROOT        Passed to converter if set.
   OVERWRITE                If 1, passes --overwrite to converter. Default: 0
+  REPORT_INTERVAL          Seconds between progress summaries. Default: 30
   SHARD_ROOT               Temp per-task output root. Default: ${OUTPUT_ROOT}__shards
   LOG_ROOT                 Per-task logs root. Default: ${SHARD_ROOT}/logs
   MERGE_MODE               move (default) or copy
@@ -55,10 +56,12 @@ MAX_EPISODES_PER_CONFIG="${MAX_EPISODES_PER_CONFIG:-0}"
 EMBODIMENT_PREFIX="${EMBODIMENT_PREFIX:-aloha-agilex}"
 INSTRUCTIONS_ROOT="${INSTRUCTIONS_ROOT:-}"
 OVERWRITE="${OVERWRITE:-0}"
+REPORT_INTERVAL="${REPORT_INTERVAL:-30}"
 SHARD_ROOT="${SHARD_ROOT:-${OUTPUT_ROOT%/}__shards}"
 LOG_ROOT="${LOG_ROOT:-${SHARD_ROOT}/logs}"
 MERGE_MODE="${MERGE_MODE:-move}"
 STATUS_ROOT="${LOG_ROOT}/status"
+REPORTED_ROOT="${LOG_ROOT}/reported"
 
 if [[ ! -d "$INPUT_ROOT" ]]; then
   echo "INPUT_ROOT does not exist: $INPUT_ROOT" >&2
@@ -70,7 +73,20 @@ if [[ "$MERGE_MODE" != "move" && "$MERGE_MODE" != "copy" ]]; then
   exit 1
 fi
 
-mkdir -p "$SHARD_ROOT" "$LOG_ROOT" "$STATUS_ROOT"
+if ! [[ "$REPORT_INTERVAL" =~ ^[0-9]+$ ]] || [[ "$REPORT_INTERVAL" -lt 1 ]]; then
+  echo "REPORT_INTERVAL must be a positive integer number of seconds, got: $REPORT_INTERVAL" >&2
+  exit 1
+fi
+
+mkdir -p "$SHARD_ROOT" "$LOG_ROOT" "$STATUS_ROOT" "$REPORTED_ROOT"
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
+log() {
+  printf '[%s] %s\n' "$(timestamp)" "$*"
+}
 
 declare -a TASKS
 if [[ "$#" -gt 0 ]]; then
@@ -96,11 +112,19 @@ echo "Shard root: $SHARD_ROOT"
 echo "Merged output root: $OUTPUT_ROOT"
 echo "Max parallel jobs: $MAX_JOBS"
 echo "Merge mode: $MERGE_MODE"
+echo "Progress report interval: ${REPORT_INTERVAL}s"
+echo "Per-task logs: ${LOG_ROOT}/<task_name>.log"
+
+for task_name in "${TASKS[@]}"; do
+  printf 'pending\n' >"${STATUS_ROOT}/${task_name}.status"
+  printf '0\n' >"${REPORTED_ROOT}/${task_name}.reported"
+done
 
 run_one_task() {
   local task_name="$1"
   local shard_out="${SHARD_ROOT}/${task_name}"
   local log_path="${LOG_ROOT}/${task_name}.log"
+  local status=0
 
   mkdir -p "$shard_out"
 
@@ -126,21 +150,126 @@ run_one_task() {
 
   {
     echo "=== task: ${task_name} ==="
+    echo "Started at: $(timestamp)"
     printf 'Command: '
     printf '%q ' "${cmd[@]}"
     echo
     "${cmd[@]}"
+    status=$?
+    echo "Finished at: $(timestamp)"
+    echo "Exit status: ${status}"
   } >"$log_path" 2>&1
+
+  return "$status"
 }
 
 active_jobs=0
 failed_jobs=0
+completed_jobs=0
+
+count_status() {
+  local want="$1"
+  local count=0
+  local task_name status_path status
+
+  for task_name in "${TASKS[@]}"; do
+    status_path="${STATUS_ROOT}/${task_name}.status"
+    [[ -f "$status_path" ]] || continue
+    status="$(<"$status_path")"
+    if [[ "$status" == "$want" ]]; then
+      count=$((count + 1))
+    fi
+  done
+
+  printf '%s\n' "$count"
+}
+
+count_finished() {
+  local count=0
+  local task_name status_path status
+
+  for task_name in "${TASKS[@]}"; do
+    status_path="${STATUS_ROOT}/${task_name}.status"
+    [[ -f "$status_path" ]] || continue
+    status="$(<"$status_path")"
+    if [[ "$status" != "running" && "$status" != "pending" ]]; then
+      count=$((count + 1))
+    fi
+  done
+
+  printf '%s\n' "$count"
+}
+
+report_finished_tasks() {
+  local task_name status_path reported_path status reported log_path
+
+  for task_name in "${TASKS[@]}"; do
+    status_path="${STATUS_ROOT}/${task_name}.status"
+    reported_path="${REPORTED_ROOT}/${task_name}.reported"
+    [[ -f "$status_path" ]] || continue
+    status="$(<"$status_path")"
+    [[ "$status" != "running" && "$status" != "pending" ]] || continue
+    reported="0"
+    if [[ -f "$reported_path" ]]; then
+      reported="$(<"$reported_path")"
+    fi
+    [[ "$reported" != "1" ]] || continue
+
+    printf '1\n' >"$reported_path"
+    log_path="${LOG_ROOT}/${task_name}.log"
+    if [[ "$status" == "0" ]]; then
+      log "Done: ${task_name} (log: ${log_path})"
+    else
+      log "FAILED: ${task_name} (exit ${status}; log: ${log_path})"
+      tail -n 20 "$log_path" || true
+    fi
+  done
+}
+
+print_progress() {
+  local running pending finished failed total
+  total="${#TASKS[@]}"
+  running="$(count_status running)"
+  pending="$(count_status pending)"
+  finished="$(count_finished)"
+  failed=0
+
+  local task_name status_path status
+  for task_name in "${TASKS[@]}"; do
+    status_path="${STATUS_ROOT}/${task_name}.status"
+    [[ -f "$status_path" ]] || continue
+    status="$(<"$status_path")"
+    if [[ "$status" != "running" && "$status" != "pending" && "$status" != "0" ]]; then
+      failed=$((failed + 1))
+    fi
+  done
+
+  log "Progress: ${finished}/${total} finished, ${running} running, ${pending} queued, ${failed} failed"
+}
+
+progress_monitor() {
+  while :; do
+    sleep "$REPORT_INTERVAL" || exit 0
+    print_progress
+  done
+}
+
+monitor_pid=""
+cleanup_monitor() {
+  if [[ -n "$monitor_pid" ]]; then
+    kill "$monitor_pid" >/dev/null 2>&1 || true
+    wait "$monitor_pid" >/dev/null 2>&1 || true
+    monitor_pid=""
+  fi
+}
+
+trap cleanup_monitor EXIT
 
 launch_one_task() {
   local task_name="$1"
   local status_path="${STATUS_ROOT}/${task_name}.status"
 
-  echo "Launching task: $task_name"
+  log "Launching task: ${task_name} (log: ${LOG_ROOT}/${task_name}.log)"
   printf 'running\n' >"$status_path"
   (
     set +e
@@ -159,7 +288,13 @@ wait_for_one_task() {
     failed_jobs=$((failed_jobs + 1))
   fi
   active_jobs=$((active_jobs - 1))
+  completed_jobs=$((completed_jobs + 1))
+  report_finished_tasks
+  print_progress
 }
+
+progress_monitor &
+monitor_pid="$!"
 
 for task_name in "${TASKS[@]}"; do
   while [[ "$active_jobs" -ge "$MAX_JOBS" ]]; do
@@ -172,6 +307,10 @@ done
 while [[ "$active_jobs" -gt 0 ]]; do
   wait_for_one_task
 done
+
+cleanup_monitor
+report_finished_tasks
+print_progress
 
 declare -a FAILED_TASKS=()
 for task_name in "${TASKS[@]}"; do
